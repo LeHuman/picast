@@ -22,6 +22,7 @@ audio_codec = aac
 audio_sink = auto
 tcp_nodelay = true
 idr_on_loss = true
+uibc_enabled = true
 kms_force_hdmi = false
 low_resource_mode = true
 rtsp_port = 7236

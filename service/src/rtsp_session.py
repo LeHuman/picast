@@ -24,6 +24,7 @@ from .platform import (
     resolve_effective_fps,
     resolve_wfd2_hevc_enabled,
 )
+from .uibc import UibcHidcBridge
 
 logger = logging.getLogger(__name__)
 MAX_RTSP_BUFFER_BYTES: Final[int] = 65536
@@ -31,6 +32,7 @@ _CSEQ_RE = re.compile(rb"CSeq:\s*(\d+)", re.IGNORECASE)
 _SESSION_RE = re.compile(r"Session:\s*([^\s;]+)", re.IGNORECASE)
 _PRES_URL_RE = re.compile(r"wfd_presentation_URL:\s*([^\s\r\n]+)", re.IGNORECASE)
 _TRANSPORT_PORTS_RE = re.compile(r"client_port=(\d+)(?:-(\d+))?")
+_UIBC_CAPABILITY_RE = re.compile(r"wfd_uibc_capability:\s*([^\r\n]+)", re.IGNORECASE)
 
 
 class SessionEventSink(Protocol):
@@ -121,6 +123,28 @@ def parse_client_rtp_port(message_text: str, default_port: int = 1028) -> int:
         return int(match.group(1))
     except ValueError:
         return default_port
+
+
+def parse_uibc_port(message_text: str) -> int | None:
+    """Extract the source's HIDC `port=<N>` from M4 `wfd_uibc_capability:`.
+
+    Returns `None` when the line is absent, when the source advertises
+    `port=none` (no UIBC offered), or when the value is not a usable TCP port,
+    matching upstream `d2.py`'s `'none' not in uibcport` gate.
+    """
+    match = _UIBC_CAPABILITY_RE.search(message_text)
+    if not match:
+        return None
+    for item in match.group(1).split(";"):
+        item = item.strip()
+        if not item.lower().startswith("port="):
+            continue
+        raw = item.split("=", 1)[1].strip()
+        if raw.lower() == "none" or not raw.isdigit():
+            return None
+        port = int(raw)
+        return port if 1 <= port <= 65535 else None
+    return None
 
 
 @dataclass(slots=True)
@@ -342,6 +366,8 @@ async def handle_rtsp_connection(
         sink_cseq = 1
         player_exited = asyncio.Event()
         player_watch_task: asyncio.Task[None] | None = None
+        uibc_bridge: UibcHidcBridge | None = None
+        uibc_task: asyncio.Task[None] | None = None
 
         idr_queue: asyncio.Queue[str] = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -457,7 +483,12 @@ async def handle_rtsp_connection(
                             params = [ln.strip() for ln in body_part.splitlines() if ln.strip()]
                             logger.info("RTSP M3 req params: %s", ", ".join(params))
                         resp_body = build_wfd_m3_response(
-                            body_part, cfg, caps, negotiated_rtp_port, display_info=display_info
+                            body_part,
+                            cfg,
+                            caps,
+                            negotiated_rtp_port,
+                            allow_uibc=cfg.uibc_enabled,
+                            display_info=display_info,
                         )
                         writer.write(format_rtsp_response(cseq, body=resp_body))
                     elif text.startswith("SET_PARAMETER"):
@@ -472,6 +503,18 @@ async def handle_rtsp_connection(
                         if "client_port=" in text:
                             negotiated_rtp_port = parse_client_rtp_port(text, cfg.rtp_port)
                         writer.write(format_rtsp_response(cseq))
+                        if cfg.uibc_enabled and uibc_bridge is None and uibc_task is None:
+                            uibc_port = parse_uibc_port(text)
+                            if uibc_port is not None:
+                                logger.info(
+                                    "RTSP M4 offers UIBC HIDC on %s:%d; starting input bridge",
+                                    peer_ip,
+                                    uibc_port,
+                                )
+                                uibc_bridge = UibcHidcBridge(peer_ip, uibc_port)
+                                uibc_task = asyncio.create_task(
+                                    uibc_bridge.run(), name=f"uibc-hidc-{peer_ip}"
+                                )
                         if "wfd_trigger_method: SETUP" in text:
                             if rtcp_transport is None:
                                 with contextlib.suppress(OSError):
@@ -519,7 +562,7 @@ async def handle_rtsp_connection(
         except Exception:
             logger.exception("Unexpected exception during RTSP session with %s", peer_ip)
         finally:
-            for bg_task in (player_watch_task, idr_task):
+            for bg_task in (player_watch_task, idr_task, uibc_task):
                 if bg_task is not None and not bg_task.done():
                     bg_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -532,6 +575,8 @@ async def handle_rtsp_connection(
                 rtcp_transport.close()
             if idr_transport is not None:
                 idr_transport.close()
+            if uibc_bridge is not None:
+                uibc_bridge.close()
             await runner.stop()
             writer.close()
             with contextlib.suppress(OSError):

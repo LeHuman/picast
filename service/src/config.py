@@ -148,6 +148,11 @@ SETTING_GUIDES: Final[dict[str, SettingGuide]] = {
         summary="Sends RTSP control packets immediately without Nagle buffering delay.",
         recommended="true",
     ),
+    "uibc_enabled": SettingGuide(
+        key="uibc_enabled",
+        summary="Forwards Pi-side USB keyboard & mouse to the Windows source over WFD UIBC HIDC.",
+        recommended="true (disable if no keyboard/mouse is attached)",
+    ),
     "idr_on_loss": SettingGuide(
         key="idr_on_loss",
         summary="Requests an instant keyframe when UDP packets are dropped.",
@@ -193,6 +198,7 @@ class PicastConfig:
     audio_sink: AudioSinkMode = AudioSinkMode.AUTO
     tcp_nodelay: bool = True
     idr_on_loss: bool = True
+    uibc_enabled: bool = True
     kms_force_hdmi: bool = False
     low_resource_mode: bool = True
     rtsp_port: int = 7236
@@ -229,6 +235,7 @@ class PicastConfig:
             audio_sink=self.audio_sink,
             tcp_nodelay=bool(self.tcp_nodelay),
             idr_on_loss=bool(self.idr_on_loss),
+            uibc_enabled=bool(self.uibc_enabled),
             kms_force_hdmi=bool(self.kms_force_hdmi),
             low_resource_mode=bool(self.low_resource_mode),
             rtsp_port=max(1024, min(65535, int(self.rtsp_port))),

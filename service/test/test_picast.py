@@ -37,6 +37,7 @@ from src.rtsp_session import (
     extract_cseq,
     extract_session_id,
     parse_presentation_url,
+    parse_uibc_port,
 )
 from src.splash import (
     PinManager,
@@ -50,6 +51,19 @@ from src.supplicant_manager import (
     parse_nm_keyfile,
     read_host_regdom,
     scan_nm_keyfiles,
+)
+from src.uibc import (
+    BTN_LEFT,
+    BTN_RIGHT,
+    EV_KEY,
+    EV_REL,
+    HIDC_DESCRIPTORS,
+    LINUX_KEY_TO_HID,
+    UibcHidcBridge,
+    UibcHidcState,
+    discover_hid_event_paths,
+    encode_keyboard_report,
+    encode_mouse_report,
 )
 from src.wifi_p2p import build_dnsmasq_args, parse_orphan_p2p_interfaces, parse_station_freq
 from src.wpa_ctrl import WpaCtrlClient, WpaCtrlMonitor, wpa_request
@@ -441,3 +455,219 @@ def test_audio_codec_default_and_validation() -> None:
     assert PicastConfig(audio_codec="AAC").validated().audio_codec == "aac"
     # Unknown values keep failing closed to LPCM (valid legacy default).
     assert PicastConfig(audio_codec="opus").validated().audio_codec == "lpcm"
+
+
+def test_uibc_enabled_config_roundtrip(tmp_path: Path) -> None:
+    assert PicastConfig().uibc_enabled is True
+    cfg_path = tmp_path / "picast.conf"
+    save_config(PicastConfig(uibc_enabled=False), cfg_path)
+    assert load_config(cfg_path).uibc_enabled is False
+    # Raw INI truthy spellings normalize through the shared bool parser.
+    cfg_path.write_text("[picast]\nuibc_enabled = yes\n", encoding="utf-8")
+    assert load_config(cfg_path).uibc_enabled is True
+
+
+def test_parse_uibc_port_variants() -> None:
+    body = (
+        "wfd_trigger_method: SETUP\r\n"
+        "wfd_uibc_capability: input_category_list=GENERIC, HIDC;"
+        "generic_cap_list=Keyboard, Mouse;"
+        "hidc_cap_list=Keyboard/USB, Mouse/USB;"
+        "port=1234\r\n"
+    )
+    assert parse_uibc_port("SET_PARAMETER rtsp://x RTSP/1.0\r\nCSeq: 3\r\n\r\n" + body) == 1234
+    # `port=none` (source not offering UIBC), blank, and out-of-range -> None.
+    assert parse_uibc_port(body.replace("port=1234", "port=none")) is None
+    assert parse_uibc_port(body.replace("port=1234", "port=")) is None
+    assert parse_uibc_port(body.replace("port=1234", "port=70000")) is None
+    # Missing wfd_uibc_capability line entirely -> None.
+    assert parse_uibc_port("SET_PARAMETER RTSP/1.0\r\n\r\nwfd_trigger_method: SETUP\r\n") is None
+
+
+def test_wfd_m3_uibc_capability_advertisement() -> None:
+    zero_caps = HostCapabilities(
+        board=BoardKind.PI_ZERO_2_W,
+        model_name="Raspberry Pi Zero 2 W",
+        has_v4l2_h264=True,
+        has_v4l2_hevc=False,
+        has_5ghz_wifi=False,
+        supports_ht40=False,
+        recommended_max_fps=30,
+    )
+    resp_on = build_wfd_m3_response(
+        "wfd_uibc_capability\r\n",
+        PicastConfig(uibc_enabled=True),
+        zero_caps,
+        1028,
+        allow_uibc=True,
+    )
+    assert "wfd_uibc_capability: input_category_list=GENERIC, HIDC;" in resp_on
+    assert "generic_cap_list=Keyboard, Mouse;" in resp_on
+    assert "hidc_cap_list=Keyboard/USB, Mouse/USB;" in resp_on
+    assert "port=none" in resp_on
+
+    # With UIBC disabled (or default `allow_uibc=False`) the capability is `none`.
+    resp_off = build_wfd_m3_response(
+        "wfd_uibc_capability\r\n", PicastConfig(), zero_caps, 1028
+    )
+    assert resp_off == "wfd_uibc_capability: none\r\n"
+    resp_disabled = build_wfd_m3_response(
+        "wfd_uibc_capability\r\n",
+        PicastConfig(uibc_enabled=False),
+        zero_caps,
+        1028,
+        allow_uibc=False,
+    )
+    assert resp_disabled == "wfd_uibc_capability: none\r\n"
+
+
+def test_hidc_descriptor_layout_and_key_table() -> None:
+    assert len(HIDC_DESCRIPTORS) == 6
+    for descriptor in HIDC_DESCRIPTORS:
+        assert descriptor[:2] == b"\x10\x01"
+        # Byte 2-3 is the descriptor's own length, matching upstream d2.py.
+        assert int.from_bytes(descriptor[2:4], "big") == len(descriptor)
+    assert LINUX_KEY_TO_HID[30] == 0x04  # KEY_A -> HID usage 'a'
+    assert LINUX_KEY_TO_HID[14] == 0x2A  # KEY_BACKSPACE
+    assert LINUX_KEY_TO_HID[106] == 0x4F  # KEY_RIGHT -> HID right arrow
+
+
+def test_uibc_hidc_keyboard_encoding() -> None:
+    state = UibcHidcState()
+    # Press left shift (code 42): modifier bit 1<<1, usage 0 (upstream parity).
+    pressed = state.translate(EV_KEY, 42, 1)[0]
+    assert len(pressed) == 18
+    expected = bytes.fromhex("00010012010000000929") + bytes((0x02, 0x00, 0x00)) + b"\x00" * 5
+    assert pressed == expected
+    # Press KEY_A (30) while shift held: usage 0x04 with sticky modifier mask.
+    pressed_a = state.translate(EV_KEY, 30, 1)[0]
+    assert pressed_a[10] == 0x02 and pressed_a[11] == 0x00 and pressed_a[12] == 0x04
+    # Release KEY_A: usage resets to 0, modifier bitmap persists.
+    released_a = state.translate(EV_KEY, 30, 0)[0]
+    assert released_a[10] == 0x02 and released_a[12] == 0x00
+    # Release left shift: modifier bit cleared.
+    released_shift = state.translate(EV_KEY, 42, 0)[0]
+    assert released_shift[10] == 0x00
+
+
+def test_uibc_hidc_mouse_encoding() -> None:
+    state = UibcHidcState()
+    # BTN_LEFT press sets button bit 1 in the 16-byte mouse report.
+    pkt = state.translate(EV_KEY, BTN_LEFT, 1)[0]
+    assert len(pkt) == 16
+    assert pkt[10] == 0x01
+    assert pkt[14:] == b"\x00\x00"
+    # REL_X clamps at +127 so fast motion never wraps to negative.
+    pkt = state.translate(EV_REL, 0, 200)[0]
+    assert pkt[10] == 0x01 and pkt[11] == 127
+    # ... and at -127 (two's complement 0x81).
+    pkt = state.translate(EV_REL, 0, -200)[0]
+    assert pkt[11] == 0x81
+    # REL_Y rides the third payload byte while dx stays 0.
+    pkt = state.translate(EV_REL, 1, 5)[0]
+    assert pkt[11] == 0 and pkt[12] == 5
+    # REL_WHEEL (code 8) is signed: -3 -> 0xFD, +1 -> 0x01.
+    pkt = state.translate(EV_REL, 8, -3)[0]
+    assert pkt[13] == 0xFD
+    pkt = state.translate(EV_REL, 8, 1)[0]
+    assert pkt[13] == 0x01
+    # BTN_RIGHT adds bit 2 alongside the still-held left button.
+    pkt = state.translate(EV_KEY, BTN_RIGHT, 1)[0]
+    assert pkt[10] == 0x03
+    # Non-mouse-button key codes >= 272 (e.g. BTN_SIDE=275) emit nothing.
+    assert state.translate(EV_KEY, 275, 1) == []
+    # EV_SYN and unknown event types emit nothing.
+    assert state.translate(0, 0, 0) == []
+
+
+def test_uibc_hidc_encoder_helpers() -> None:
+    kb = encode_keyboard_report(0x05, 0x04)
+    assert kb == bytes.fromhex("00010012010000000929") + bytes((0x05, 0x00, 0x04)) + b"\x00" * 5
+    assert len(kb) == 18
+    mouse = encode_mouse_report(0x01, dx=3, dy=0, wheel=0)
+    assert mouse == bytes.fromhex("00010010010100000628") + bytes((0x01, 3, 0, 0)) + b"\x00" * 2
+    assert len(mouse) == 16
+    # Wheel of exactly -1/+1 matches upstream's 0xFF/0x01 wire bytes.
+    assert encode_mouse_report(0, wheel=-1)[13] == 0xFF
+    assert encode_mouse_report(0, wheel=1)[13] == 0x01
+
+
+def test_discover_hid_event_paths_matches_kbd_mouse_ignores_hdmi(tmp_path: Path) -> None:
+    sys_root = tmp_path / "class" / "input"
+    dev_root = tmp_path / "dev" / "input"
+
+    def make_event(name: str, key: str, rel: str) -> None:
+        caps = sys_root / name / "device" / "capabilities"
+        caps.mkdir(parents=True)
+        (caps / "key").write_text(key, encoding="ascii")
+        (caps / "rel").write_text(rel, encoding="ascii")
+
+    zero_word = "0000000000000000"
+    # USB keyboard (padded 64-bit words): KEY_A = bit 30 in the rightmost word.
+    make_event("event0", " ".join([zero_word] * 11) + " 0000000040000000", "0")
+    # USB mouse: BTN_LEFT = bit 272 (64-bit word 4, bit 16) plus rel bits 0x3.
+    mouse_key = "0000000000010000 " + " ".join(["0"] * 4)
+    make_event("event1", mouse_key, " ".join([zero_word] * 11) + " 0000000000000003")
+    # Same mouse rendered unpadded (kernel trims leading zero words).
+    make_event("event2", "10000 0 0 0 0", "3")
+    # vc4-hdmi style HDMI audio node: rel=3 but neither KEY_A nor BTN_LEFT.
+    make_event("event3", "0", "3")
+
+    dev_root.mkdir(parents=True)
+    for name in ("event0", "event1", "event2"):
+        (dev_root / name).touch()
+
+    discovered = discover_hid_event_paths(sys_root, dev_root)
+    assert discovered == [dev_root / "event0", dev_root / "event1", dev_root / "event2"]
+    # Missing sysfs root (or missing /dev/input counterparts) discovers nothing.
+    assert discover_hid_event_paths(tmp_path / "absent", dev_root) == []
+
+
+def test_uibc_bridge_loopback_handshake_and_graceful_refusal(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        received = bytearray()
+        got_descriptors = asyncio.Event()
+        total = sum(len(descriptor) for descriptor in HIDC_DESCRIPTORS)
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            _ = writer
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    return
+                received.extend(chunk)
+                if len(received) >= total:
+                    got_descriptors.set()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        assert server.sockets is not None
+        port = int(server.sockets[0].getsockname()[1])
+        bridge = UibcHidcBridge(
+            "127.0.0.1",
+            port,
+            sys_input_root=tmp_path / "absent-sys",
+            dev_input_root=tmp_path / "absent-dev",
+        )
+        try:
+            assert await bridge.start() is True
+            await asyncio.wait_for(got_descriptors.wait(), timeout=3.0)
+            # Exact upstream descriptor handshake (m1..m6) arrived over TCP.
+            assert bytes(received) == b"".join(HIDC_DESCRIPTORS)
+        finally:
+            bridge.close()
+            server.close()
+            await server.wait_closed()
+
+        # A refused TCP port degrades gracefully to False without raising.
+        dead = UibcHidcBridge(
+            "127.0.0.1",
+            port,
+            sys_input_root=tmp_path,
+            dev_input_root=tmp_path,
+            connect_attempts=2,
+            connect_delay_s=0.01,
+        )
+        assert await dead.start() is False
+        dead.close()
+
+    asyncio.run(scenario())
