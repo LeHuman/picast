@@ -75,6 +75,10 @@ _FB_STATUS_COLOR: Final[bytes] = b"\xb8\xa3\x94\xff"  # RGB(148, 163, 184) muted
 _FB_TRANSPORT_COLOR: Final[bytes] = b"\x76\x66\x5a\xff"  # dimmest slate footer
 _FB_STAR_COLOR: Final[bytes] = b"\xc8\xaa\x96\xff"  # RGB(150,170,200) faint cool starlight
 
+# WIN + K attract-screen blink: a hard cut, no fade, between warm white and
+# this dim factor (applied to RGB only).
+_BLINK_DIM: Final[float] = 0.18
+
 _ANSI_RESET: Final[str] = "\033[0m"
 _ANSI_WORDMARK: Final[str] = "\033[38;2;90;102;118m"
 _ANSI_ACCENT: Final[str] = "\033[38;2;255;210;82m"
@@ -370,10 +374,11 @@ def build_fb_canvas(
     All positions are derived from `width`/`height` fractions so 640x480,
     1280x720, and 1920x1080 stay balanced with no hardcoded pixel offsets.
 
-    `phase` in [0.0, 1.0) softly pulses the WIN + K shortcut only (attract-screen
-    blink; phase 0.0 = full warm white, phase 0.5 = 30%). `starfield`, when given,
-    is composited first so stars twinkle under the text. Defaults keep static
-    renders identical to the pre-animation layout.
+    `phase` in [0.0, 1.0) hard-blinks the WIN + K shortcut only: warm white for
+    the first half of the cycle, dim slate gray for the second half, with no
+    in-between values. `starfield`, when given, is composited first so stars
+    twinkle under the text. Defaults keep static renders identical to the
+    pre-animation layout.
     """
     if bpp not in (16, 32):
         raise ValueError(f"unsupported framebuffer depth: {bpp}")
@@ -446,7 +451,7 @@ def build_fb_canvas(
     # Only the WIN + K line pulses with `phase`; nothing else blinks.
     device_scale = max(3, width // 160)
     winkey_y = pin_y + 7 * pin_scale + height // 18
-    blink = 0.18 + 0.82 * (0.5 + 0.5 * math.cos(2 * math.pi * phase))
+    blink = 1.0 if phase % 1.0 < 0.5 else _BLINK_DIM
     draw_block_text("WIN + K", winkey_y, device_scale, _scale_color(_FB_DEVICE_COLOR, blink))
     device_name = state.device_name.strip().upper()[:12]
     if device_name and device_name != "PICAST":

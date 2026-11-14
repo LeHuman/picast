@@ -44,6 +44,7 @@ from src.rtsp_session import (
     parse_uibc_port,
 )
 from src.splash import (
+    _BLINK_DIM,
     _FB_DEVICE_COLOR,
     _FB_STAR_COLOR,
     PinManager,
@@ -381,7 +382,7 @@ def test__scale_color_identity_half_clamp_alpha() -> None:
 
 
 def test_build_fb_canvas_blink_phase() -> None:
-    """Phase 0.0 vs 0.5 with no stars: canvases differ; only the WIN+K band changes."""
+    """The WIN + K band blinks hard between warm white and dim gray."""
     state = _splash_canvas_state()
     bright = build_fb_canvas(state, 1280, 720, phase=0.0)
     dim = build_fb_canvas(state, 1280, 720, phase=0.5)
@@ -391,7 +392,7 @@ def test_build_fb_canvas_blink_phase() -> None:
     white_offsets = {i for i in range(0, len(bright), 4) if bright[i : i + 4] == _FB_DEVICE_COLOR}
     assert white_offsets
 
-    dim_offset = _scale_color(_FB_DEVICE_COLOR, 0.18)
+    dim_offset = _scale_color(_FB_DEVICE_COLOR, _BLINK_DIM)
     for i in white_offsets:
         # Only WIN + K pixels dim; device-name pixels (also white) stay bright.
         if bright[i : i + 4] != dim[i : i + 4]:
@@ -400,6 +401,13 @@ def test_build_fb_canvas_blink_phase() -> None:
     diff_offsets = {i for i in range(0, len(bright), 4) if bright[i : i + 4] != dim[i : i + 4]}
     assert diff_offsets
     assert diff_offsets <= white_offsets
+
+    # Binary, not a fade: every phase in the first half renders identically,
+    # as does every phase in the second half.
+    for early, late in ((0.05, 0.49), (0.55, 0.99)):
+        assert build_fb_canvas(state, 1280, 720, phase=early) == build_fb_canvas(
+            state, 1280, 720, phase=late
+        )
 
     # Corner background pixels unchanged in both renders.
     for x, y in ((0, 0), (1279, 719)):
