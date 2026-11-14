@@ -40,7 +40,7 @@ struct RtpPacketView {
 struct JitterConfig {
     std::size_t capacity_packets{kDefaultJitterCapacity};
     std::chrono::milliseconds max_hold_time{std::chrono::milliseconds{45}};
-    std::chrono::milliseconds idr_cooldown{std::chrono::milliseconds{800}};
+    std::chrono::milliseconds idr_cooldown{std::chrono::milliseconds{4000}};
     std::uint8_t expected_payload_type{33U};  // 33 = MPEG-2 TS (RFC 2250), 0 = accept any.
 };
 

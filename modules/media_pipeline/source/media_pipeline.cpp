@@ -92,17 +92,20 @@ constexpr std::uint16_t kDefaultTsdemuxLatencyMs = 45U;
 }
 
 [[nodiscard]] std::string build_audio_sink_element(AudioSinkKind sink) {
+    // On Raspberry Pi OS Trixie, `pipewire-alsa` maps ALSA `default` to the
+    // logged-in user's PipeWire daemon, which `picast.service` (root) cannot
+    // open (`Host is down`). `alsasink device=sysdefault` opens the ALSA
+    // hardware card directly while still letting explicit `pipewire` work.
     switch (sink) {
         case AudioSinkKind::PipeWire:
             return "pipewiresink";
-        case AudioSinkKind::Hdmi:
-            return "alsasink device=default";
         case AudioSinkKind::HeadphoneJack:
             return "alsasink device=plughw:Headphones,0";
+        case AudioSinkKind::Hdmi:
         case AudioSinkKind::Alsa:
         case AudioSinkKind::Auto:
         default:
-            return "alsasink";
+            return "alsasink device=sysdefault";
     }
 }
 
@@ -126,7 +129,8 @@ std::string build_gstreamer_pipeline_description(
         // `tsdemux` adds no demux-side latency unless explicitly overridden
         // (the app defaults `ts_demux_latency_ms` to 0 for this path).
         source_stage = std::format(
-            "appsrc name=ts_src is-live=true do-timestamp=true format=time block=false "
+            "appsrc name=ts_src is-live=true do-timestamp=true format=time "
+            "block=false max-bytes=524288 leaky-type=downstream "
             "caps=video/mpegts,systemstream=true,packetsize=188 ! "
             "tsdemux name=demux latency={}",
             cfg.ts_demux_latency_ms);

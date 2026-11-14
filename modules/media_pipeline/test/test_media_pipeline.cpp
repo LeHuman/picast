@@ -88,6 +88,7 @@ void test_latency_defaults_and_queue_bounds() {
     // this to 0 unless explicitly overridden via `--ts-demux-latency-ms`.
     const auto appsrc_pipe = picast::build_gstreamer_pipeline_description(cfg, caps, true);
     EXPECT_TRUE(appsrc_pipe.find("appsrc name=ts_src") != std::string::npos);
+    EXPECT_TRUE(appsrc_pipe.find("leaky-type=downstream") != std::string::npos);
     EXPECT_TRUE(appsrc_pipe.find("tsdemux name=demux latency=45") != std::string::npos);
     // Pre-decode compressed-frame queue must be bounded (no 200-buffer / 1 s defaults).
     EXPECT_TRUE(appsrc_pipe.find("queue max-size-buffers=12 max-size-bytes=0 max-size-time=0")
@@ -118,6 +119,12 @@ void test_latency_defaults_and_queue_bounds() {
     const auto no_can_scale =
         picast::build_gstreamer_pipeline_description(cfg, caps, true);
     EXPECT_TRUE(no_can_scale.find("can-scale") == std::string::npos);
+
+    // Default / HDMI ALSA sinks must bypass PipeWire's user-scoped `default` PCM.
+    EXPECT_TRUE(no_can_scale.find("alsasink device=sysdefault") != std::string::npos);
+    cfg.audio_sink = picast::AudioSinkKind::Hdmi;
+    const auto hdmi_audio = picast::build_gstreamer_pipeline_description(cfg, caps, true);
+    EXPECT_TRUE(hdmi_audio.find("alsasink device=sysdefault") != std::string::npos);
 }
 
 }  // namespace
