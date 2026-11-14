@@ -6,7 +6,9 @@ import asyncio
 import socket
 import stat
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -669,5 +671,80 @@ def test_uibc_bridge_loopback_handshake_and_graceful_refusal(tmp_path: Path) -> 
         )
         assert await dead.start() is False
         dead.close()
+
+    asyncio.run(scenario())
+
+
+class _StubEventLoop:
+    """Minimal reader-recording loop stand-in for rescan tests.
+
+    A real selector event loop cannot epoll regular tmp files (the fds here
+    are plain files, not input char devices), so record registrations instead.
+    """
+
+    def __init__(self) -> None:
+        self.registered: set[int] = set()
+
+    def add_reader(self, fd: int, callback: Callable[..., object], *args: object) -> None:
+        # Mimic the real loop: same fd may not be registered twice.
+        assert fd not in self.registered, f"fd {fd} already registered"
+        self.registered.add(fd)
+
+    def remove_reader(self, fd: int) -> bool:
+        if fd in self.registered:
+            self.registered.remove(fd)
+            return True
+        return False
+
+
+def test_uibc_bridge_rescan_grabs_hot_plugged_devices_once(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        sys_root = tmp_path / "class" / "input"
+        dev_root = tmp_path / "dev" / "input"
+        dev_root.mkdir(parents=True)
+
+        def make_event(name: str, key: str, rel: str) -> None:
+            caps = sys_root / name / "device" / "capabilities"
+            caps.mkdir(parents=True)
+            (caps / "key").write_text(key, encoding="ascii")
+            (caps / "rel").write_text(rel, encoding="ascii")
+
+        bridge = UibcHidcBridge("127.0.0.1", 1, sys_input_root=sys_root, dev_input_root=dev_root)
+        # A real selector loop refuses to epoll regular tmp files, so use
+        # a reader-recording stub instead of the running loop.
+        stub_loop = _StubEventLoop()
+        bridge._loop = cast(asyncio.AbstractEventLoop, stub_loop)
+        bridge._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # Nothing plugged at M4 time: the rescan finds nothing.
+            assert bridge.rescan_for_new_devices() == 0
+
+            # A keyboard and a mouse are hot-plugged after the negotiation.
+            zero_word = "0000000000000000"
+            # USB keyboard: KEY_A = bit 30 in the rightmost 64-bit word.
+            make_event("event0", " ".join([zero_word] * 11) + " 0000000040000000", "0")
+            # USB mouse: BTN_LEFT (word 4, bit 16) plus rel bits 0x3.
+            make_event(
+                "event1",
+                "0000000000010000 0 0 0 0",
+                " ".join([zero_word] * 11) + " 0000000000000003",
+            )
+            (dev_root / "event0").touch()
+            (dev_root / "event1").touch()
+
+            assert bridge.rescan_for_new_devices() == 2
+            # Repeated rescans are no-ops: no duplicate grabs, count stable.
+            assert bridge.rescan_for_new_devices() == 2
+            assert bridge.rescan_for_new_devices() == 2
+            assert len(bridge._devices) == 2
+            assert {device.path for device in bridge._devices} == {
+                dev_root / "event0",
+                dev_root / "event1",
+            }
+            # Exactly one reader per grabbed device, kept registered.
+            assert stub_loop.registered == {bridge._devices[0].fd, bridge._devices[1].fd}
+        finally:
+            bridge.close()
+        assert stub_loop.registered == set()
 
     asyncio.run(scenario())

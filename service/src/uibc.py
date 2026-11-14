@@ -323,6 +323,7 @@ class UibcHidcBridge:
         connect_delay_s: float = 0.1,
         connect_timeout_s: float = 1.0,
         descriptor_gap_s: float = 0.01,
+        hotplug_rescan_s: float = 2.0,
     ) -> None:
         self._peer_ip = peer_ip
         self._port = port
@@ -332,6 +333,7 @@ class UibcHidcBridge:
         self._connect_delay_s = connect_delay_s
         self._connect_timeout_s = connect_timeout_s
         self._descriptor_gap_s = descriptor_gap_s
+        self._hotplug_rescan_s = hotplug_rescan_s
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sock: socket.socket | None = None
         self._devices: list[_GrabbedInputDevice] = []
@@ -342,9 +344,36 @@ class UibcHidcBridge:
         """Start the bridge and serve until cancelled or the TCP link drops."""
         try:
             if await self.start():
-                await self._done.wait()
+                # Periodically re-scan for newly plugged keyboards/mice:
+                # devices hot-plugged after the M4 negotiation would otherwise
+                # never be forwarded.
+                while True:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(self._done.wait()), timeout=self._hotplug_rescan_s
+                        )
+                        break  # _done set
+                    except TimeoutError:
+                        self.rescan_for_new_devices()
         finally:
             self.close()
+
+    def rescan_for_new_devices(self) -> int:
+        """Re-scan sysfs for hot-plugged keyboards/mice and grab new ones.
+
+        Returns the current device count. Safe to call repeatedly; only
+        paths not already grabbed are opened.
+        """
+        if self._closed or self._loop is None or self._sock is None:
+            return 0
+        before = len(self._devices)
+        known = {device.path for device in self._devices}
+        for path in discover_hid_event_paths(self._sys_input_root, self._dev_input_root):
+            if path not in known:
+                self._open_and_grab(path, self._loop)
+        if len(self._devices) != before:
+            logger.info("UIBC HIDC bridge now forwarding %d input device(s)", len(self._devices))
+        return len(self._devices)
 
     async def start(self) -> bool:
         """Connect, handshake, and grab input devices. False on graceful failure."""
