@@ -530,7 +530,7 @@ def run_splash_animation(
     stop_event: threading.Event,
     *,
     tick_s: float = 0.10,
-    blink_period_s: float = 1.4,
+    blink_period_s: float = 1.0,
     rng: random.Random | None = None,
 ) -> None:
     """Blocking game-attract loop for a daemon thread: pulsing WIN + K plus twinkling stars.

@@ -27,7 +27,7 @@ sys.path.insert(0, str(SERVICE_ROOT))
 
 from src.splash import SplashState, StarField, build_fb_canvas  # noqa: E402
 
-BLINK_PERIOD_S = 1.4  # keep in sync with run_splash_animation's default
+BLINK_PERIOD_S = 1.0  # keep in sync with run_splash_animation's default
 
 
 def _png_chunk(tag: bytes, payload: bytes) -> bytes:
