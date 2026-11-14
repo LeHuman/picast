@@ -51,8 +51,10 @@ from src.splash import (
     Star,
     StarField,
     _fb_background,
+    _fb_pattern,
     _scale_color,
     build_fb_canvas,
+    fb0_geometry,
     format_ansi_splash,
     generate_wps_pin,
     render_color_block_text,
@@ -281,6 +283,9 @@ _FB_SLATE_PIXEL = b"\xb8\xa3\x94\xff"
 _FB_DIM_PIXEL = b"\x76\x66\x5a\xff"
 
 
+_FB_BG_PIXEL_16 = _fb_pattern(_FB_BG_PIXEL, 16)
+
+
 def _splash_canvas_state() -> SplashState:
     return SplashState(
         device_name="LIVINGROOM",
@@ -290,13 +295,15 @@ def _splash_canvas_state() -> SplashState:
     )
 
 
-def _pixel_at(canvas: bytearray, width: int, x: int, y: int) -> bytes:
-    off = (y * width + x) * 4
-    return bytes(canvas[off : off + 4])
+def _pixel_at(canvas: bytearray, width: int, x: int, y: int, bpp: int = 32) -> bytes:
+    pp = bpp // 8
+    off = (y * width + x) * pp
+    return bytes(canvas[off : off + pp])
 
 
-def _row_has(canvas: bytearray, width: int, y: int, pixel: bytes) -> bool:
-    row = canvas[y * width * 4 : (y + 1) * width * 4]
+def _row_has(canvas: bytearray, width: int, y: int, pixel: bytes, bpp: int = 32) -> bool:
+    pp = bpp // 8
+    row = canvas[y * width * pp : (y + 1) * width * pp]
     return pixel in row
 
 
@@ -327,6 +334,21 @@ def test_build_fb_canvas_geometry_and_palette_1080p() -> None:
     # Hero is by far the most present color on screen.
     assert canvas.count(_FB_AMBER_PIXEL) > canvas.count(_FB_WHITE_PIXEL)
     assert canvas.count(_FB_AMBER_PIXEL) > canvas.count(_FB_SLATE_PIXEL)
+
+
+def test_build_fb_canvas_16bpp_rgb565() -> None:
+    """16-bpp canvases are packed RGB565 (Pi Zero 2 W's vc4-hdmi framebuffer)."""
+    width, height = 640, 480
+    canvas = build_fb_canvas(_splash_canvas_state(), width, height, bpp=16)
+    assert len(canvas) == width * height * 2
+    assert _pixel_at(canvas, width, 0, 0, 16) == _FB_BG_PIXEL_16
+    assert _pixel_at(canvas, width, width - 1, height - 1, 16) == _FB_BG_PIXEL_16
+    # Amber hero still present in the middle band after 16-bit packing.
+    amber16 = _fb_pattern(_FB_AMBER_PIXEL, 16)
+    assert any(_row_has(canvas, width, y, amber16, 16) for y in range(height // 3, 2 * height // 3))
+    # Unsupported depths are rejected rather than silently corrupting the frame.
+    with pytest.raises(ValueError):
+        build_fb_canvas(_splash_canvas_state(), width, height, bpp=8)
 
 
 @pytest.mark.parametrize(
@@ -369,7 +391,7 @@ def test_build_fb_canvas_blink_phase() -> None:
     white_offsets = {i for i in range(0, len(bright), 4) if bright[i : i + 4] == _FB_DEVICE_COLOR}
     assert white_offsets
 
-    dim_offset = _scale_color(_FB_DEVICE_COLOR, 0.30)
+    dim_offset = _scale_color(_FB_DEVICE_COLOR, 0.18)
     for i in white_offsets:
         # Only WIN + K pixels dim; device-name pixels (also white) stay bright.
         if bright[i : i + 4] != dim[i : i + 4]:
@@ -427,9 +449,9 @@ def test_starfield_tick_spawns_expiry_and_birth_dimness() -> None:
     for star in field.stars:
         assert 0 <= star.x < 640
         assert 0 <= star.y < 480
-        assert star.size_px in (1, 2)
-        assert 1.5 <= star.lifetime_s <= 3.0
-        assert 0.2 <= star.peak <= 0.45
+        assert star.size_px in (2, 3)
+        assert 1.2 <= star.lifetime_s <= 2.6
+        assert 0.45 <= star.peak <= 0.95
         assert star.born == 0.0
 
     # A brightness-zero draw at exactly born == now leaves the background untouched.
@@ -456,8 +478,8 @@ def test_starfield_tick_spawns_expiry_and_birth_dimness() -> None:
 
 
 def test_starfield_default_max_stars_caps() -> None:
-    assert StarField(640, 480, random.Random(5)).max_stars == 6
-    assert StarField(1920, 1080, random.Random(5)).max_stars == max(6, (1920 * 1080) // 90_000)
+    assert StarField(640, 480, random.Random(5)).max_stars == 16
+    assert StarField(1920, 1080, random.Random(5)).max_stars == (1920 * 1080) // 30_000
 
 
 def test_build_fb_canvas_defaults_static(tmp_path: Path) -> None:
@@ -954,3 +976,22 @@ def test_uibc_bridge_rescan_grabs_hot_plugged_devices_once(tmp_path: Path) -> No
         assert stub_loop.registered == set()
 
     asyncio.run(scenario())
+
+
+def test_fb_pattern_32bpp_identity() -> None:
+    """32-bpp framebuffers receive BGRA pixels unchanged."""
+    assert _fb_pattern(b"\x00\x11\x22\xff", 32) == b"\x00\x11\x22\xff"
+
+
+def test_fb_pattern_16bpp_rgb565() -> None:
+    """16-bpp (Pi Zero 2 W vc4-hdmi) packs little-endian RGB565."""
+    assert _fb_pattern(b"\x00\x00\x00\xff", 16) == b"\x00\x00"  # black
+    assert _fb_pattern(b"\xff\xff\xff\xff", 16) == b"\xff\xff"  # white
+    assert _fb_pattern(b"\x00\x00\xff\xff", 16) == b"\x00\xf8"  # pure red
+    assert _fb_pattern(_FB_BG_PIXEL, 16) == _FB_BG_PIXEL_16
+    # Amber hero PIN color: 0xFE8A when packed little-endian.
+    assert _fb_pattern(_FB_AMBER_PIXEL, 16) == b"\x8a\xfe"
+
+
+def test_fb0_geometry_missing_device_returns_none() -> None:
+    assert fb0_geometry(Path("/nonexistent/fb0")) is None

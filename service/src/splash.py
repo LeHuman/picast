@@ -63,7 +63,8 @@ _FONT_5X7: Final[dict[str, tuple[str, ...]]] = {
 
 
 # Splash palette — deep charcoal-navy field with a warm amber hero.
-# FB colors are BGRA byte tuples for the 32-bpp `/dev/fb0` framebuffer;
+# FB colors are BGRA byte tuples; `_fb_pattern` packs them into the framebuffer's
+# native layout (BGRA at 32-bpp, little-endian RGB565 at 16-bpp).
 # ANSI values are matching 24-bit truecolor SGR codes for `/dev/tty1`.
 _FB_BG_PIXEL: Final[bytes] = b"\x1a\x12\x0c\xff"  # RGB(12, 18, 26) deep charcoal navy
 _FB_WORDMARK_COLOR: Final[bytes] = b"\x76\x66\x5a\xff"  # RGB(90, 102, 118) dim slate
@@ -264,13 +265,17 @@ class StarField:
         rng: random.Random,
         *,
         max_stars: int | None = None,
-        spawn_per_tick: int = 1,
+        spawn_per_tick: int = 3,
+        bpp: int = 32,
     ) -> None:
         self.width = width
         self.height = height
         self.rng = rng
-        self.max_stars = max_stars if max_stars is not None else max(6, (width * height) // 90_000)
+        self.max_stars = (
+            max_stars if max_stars is not None else max(16, (width * height) // 30_000)
+        )
         self.spawn_per_tick = spawn_per_tick
+        self.bpp = bpp
         self.now_s = 0.0
         self.stars: list[Star] = []
 
@@ -290,10 +295,10 @@ class StarField:
                 Star(
                     x=self.rng.randint(0, self.width - 1),
                     y=self.rng.randint(0, self.height - 1),
-                    size_px=2 if self.rng.random() < 0.2 else 1,
+                    size_px=3 if self.rng.random() < 0.15 else 2,
                     age_s=0.0,
-                    lifetime_s=self.rng.uniform(1.5, 3.0),
-                    peak=self.rng.uniform(0.2, 0.45),
+                    lifetime_s=self.rng.uniform(1.2, 2.6),
+                    peak=self.rng.uniform(0.45, 0.95),
                     born=now_s,
                 )
             )
@@ -304,7 +309,8 @@ class StarField:
         """Composite all stars under the text layer using the same bounds-checked
         inner-loop style as `build_fb_canvas`; `now_s` defaults to the last `tick`."""
         t = self.now_s if now_s is None else now_s
-        stride = width * 4
+        bytes_per_px = self.bpp // 8
+        stride = width * bytes_per_px
         for star in self.stars:
             age = max(0.0, min(t - star.born, star.lifetime_s))
             brightness = star.peak * math.sin(math.pi * age / star.lifetime_s)
@@ -316,30 +322,31 @@ class StarField:
             span = min(star.size_px, width - px0)
             if span <= 0:
                 continue
-            row = _scale_color(_FB_STAR_COLOR, brightness) * span
-            span_bytes = span * 4
+            pixel = _fb_pattern(_scale_color(_FB_STAR_COLOR, brightness), self.bpp)
+            row = pixel * span
+            span_bytes = span * bytes_per_px
             for dy in range(star.size_px):
                 py = star.y + dy
                 if py < 0 or py >= height:
                     continue
-                off = py * stride + px0 * 4
+                off = py * stride + px0 * bytes_per_px
                 canvas[off : off + span_bytes] = row
 
 
-_FB_BG_CACHE: dict[tuple[int, int], bytes] = {}
+_FB_BG_CACHE: dict[tuple[int, int, int], bytes] = {}
 
 
-def _fb_background(width: int, height: int) -> bytes:
-    """Immutable full-screen background buffer, cached per resolution.
+def _fb_background(width: int, height: int, bpp: int = 32) -> bytes:
+    """Immutable full-screen background buffer, cached per resolution and format.
 
-    Building `bg_pixel * (width * height)` on every redraw costs megabytes of
-    allocation for an identical result; cache the template once per (w, h) and
-    copy it into a fresh mutable `bytearray` per redraw.
+    Building the background on every redraw costs megabytes of allocation for an
+    identical result; cache the template once per (w, h, bpp) and copy it into a
+    fresh mutable `bytearray` per redraw.
     """
-    key = (width, height)
+    key = (width, height, bpp)
     bg = _FB_BG_CACHE.get(key)
     if bg is None:
-        bg = _FB_BG_PIXEL * (width * height)
+        bg = _fb_pattern(_FB_BG_PIXEL, bpp) * (width * height)
         _FB_BG_CACHE[key] = bg
     return bg
 
@@ -351,21 +358,28 @@ def build_fb_canvas(
     *,
     phase: float = 0.0,
     starfield: StarField | None = None,
+    bpp: int = 32,
 ) -> bytearray:
     """Pure, side-effect-free splash canvas builder for one framebuffer redraw.
 
-    Renders the shared splash hierarchy into a 32-bpp BGRA buffer sized
-    `width * height * 4`. All positions are derived from `width`/`height`
-    fractions so 640x480, 1280x720, and 1920x1080 stay balanced with no
-    hardcoded pixel offsets.
+    Renders the shared splash hierarchy directly into the framebuffer's native
+    pixel format — 32-bpp BGRA, or 16-bpp little-endian RGB565 (the vc4-hdmi
+    framebuffer on Pi Zero 2 W). Writing native pixels avoids a per-pixel
+    conversion pass over ~2M pixels, which is unusably slow in pure Python.
+
+    All positions are derived from `width`/`height` fractions so 640x480,
+    1280x720, and 1920x1080 stay balanced with no hardcoded pixel offsets.
 
     `phase` in [0.0, 1.0) softly pulses the WIN + K shortcut only (attract-screen
     blink; phase 0.0 = full warm white, phase 0.5 = 30%). `starfield`, when given,
     is composited first so stars twinkle under the text. Defaults keep static
-    renders byte-identical to the pre-animation layout.
+    renders identical to the pre-animation layout.
     """
-    stride = width * 4
-    canvas = bytearray(_fb_background(width, height))
+    if bpp not in (16, 32):
+        raise ValueError(f"unsupported framebuffer depth: {bpp}")
+    bytes_per_px = bpp // 8
+    stride = width * bytes_per_px
+    canvas = bytearray(_fb_background(width, height, bpp))
 
     if starfield is not None:
         starfield.draw(canvas, width, height)
@@ -374,6 +388,7 @@ def build_fb_canvas(
         cleaned = "".join(ch if ch in _FONT_5X7 else " " for ch in text.upper())
         total_cols = len(cleaned) * 6 - 1
         start_x = max(0, (width - total_cols * scale) // 2)
+        pixel = _fb_pattern(color_bgra, bpp)
         for idx, ch in enumerate(cleaned):
             glyph = _FONT_5X7[ch]
             gx = start_x + idx * 6 * scale
@@ -388,13 +403,13 @@ def build_fb_canvas(
                     if span <= 0:
                         continue
                     py0 = y0 + r_i * scale
-                    row = color_bgra * span
-                    span_bytes = span * 4
+                    row = pixel * span
+                    span_bytes = span * bytes_per_px
                     for dy in range(scale):
                         py = py0 + dy
                         if py < 0 or py >= height:
                             continue
-                        off = py * stride + px0 * 4
+                        off = py * stride + px0 * bytes_per_px
                         canvas[off : off + span_bytes] = row
 
     def draw_rule(y0: int, thickness: int, rule_width: int, color_bgra: bytes) -> None:
@@ -402,13 +417,13 @@ def build_fb_canvas(
         span = min(rule_width, width - x0)
         if span <= 0:
             return
-        row = color_bgra * span
+        row = _fb_pattern(color_bgra, bpp) * span
         for dy in range(thickness):
             py = y0 + dy
             if py < 0 or py >= height:
                 continue
-            off = py * stride + x0 * 4
-            canvas[off : off + span * 4] = row
+            off = py * stride + x0 * bytes_per_px
+            canvas[off : off + span * bytes_per_px] = row
 
     # 1. Dim wordmark in the upper area, never glued to the top edge.
     wordmark_scale = max(2, width // 240)
@@ -431,7 +446,7 @@ def build_fb_canvas(
     # Only the WIN + K line pulses with `phase`; nothing else blinks.
     device_scale = max(3, width // 160)
     winkey_y = pin_y + 7 * pin_scale + height // 18
-    blink = 0.30 + 0.70 * (0.5 + 0.5 * math.cos(2 * math.pi * phase))
+    blink = 0.18 + 0.82 * (0.5 + 0.5 * math.cos(2 * math.pi * phase))
     draw_block_text("WIN + K", winkey_y, device_scale, _scale_color(_FB_DEVICE_COLOR, blink))
     device_name = state.device_name.strip().upper()[:12]
     if device_name and device_name != "PICAST":
@@ -451,11 +466,12 @@ def build_fb_canvas(
     return canvas
 
 
-def fb0_geometry(fb_path: Path = Path("/dev/fb0")) -> tuple[int, int] | None:
-    """Probe for a usable 32-bpp `/dev/fb0` of at least 640x480; `(width, height)` or None.
+def fb0_geometry(fb_path: Path = Path("/dev/fb0")) -> tuple[int, int, int] | None:
+    """Probe for a usable `/dev/fb0` of at least 640x480; `(width, height, bpp)` or None.
 
     Single source of truth for the sysfs probe used by both the static splash
-    write and the animation loop.
+    write and the animation loop. Supports 32-bpp BGRA and 16-bpp RGB565 (the
+    vc4-hdmi framebuffer on Pi Zero 2 W is 16-bpp).
     """
     sysfs_size = Path("/sys/class/graphics/fb0/virtual_size")
     sysfs_bpp = Path("/sys/class/graphics/fb0/bits_per_pixel")
@@ -469,13 +485,26 @@ def fb0_geometry(fb_path: Path = Path("/dev/fb0")) -> tuple[int, int] | None:
     except (OSError, ValueError):
         return None
 
-    if bpp != 32 or width < 640 or height < 480:
+    if bpp not in (16, 32) or width < 640 or height < 480:
         return None
-    return width, height
+    return width, height, bpp
+
+
+def _fb_pattern(color_bgra: bytes, bpp: int) -> bytes:
+    """Return the per-pixel byte pattern for the framebuffer's native format.
+
+    32-bpp: 4-byte BGRA as-is (driver ignores alpha). 16-bpp: little-endian
+    RGB565 — the vc4-hdmi framebuffer on Pi Zero 2 W is 16-bpp.
+    """
+    if bpp == 32:
+        return color_bgra
+    b, g, r, _a = color_bgra
+    value = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+    return bytes((value & 0xFF, value >> 8))
 
 
 def _write_fb0_splash(state: SplashState, fb_path: Path = Path("/dev/fb0")) -> bool:
-    """Attempt pixel-exact 32-bpp BGRA rendering directly to `/dev/fb0`.
+    """Attempt pixel-exact rendering directly to `/dev/fb0` (32-bpp BGRA or 16-bpp RGB565).
 
     Only the geometry probe and the write happen here; all canvas-building lives
     in the pure `build_fb_canvas` so layouts are testable without a framebuffer.
@@ -483,9 +512,9 @@ def _write_fb0_splash(state: SplashState, fb_path: Path = Path("/dev/fb0")) -> b
     geometry = fb0_geometry(fb_path)
     if geometry is None:
         return False
-    width, height = geometry
+    width, height, bpp = geometry
 
-    canvas = build_fb_canvas(state, width, height)
+    canvas = build_fb_canvas(state, width, height, bpp=bpp)
 
     try:
         with fb_path.open("r+b", buffering=0) as fb:
@@ -500,21 +529,24 @@ def run_splash_animation(
     state_factory: Callable[[], SplashState],
     stop_event: threading.Event,
     *,
-    tick_s: float = 0.4,
-    blink_period_s: float = 3.0,
+    tick_s: float = 0.10,
+    blink_period_s: float = 1.4,
     rng: random.Random | None = None,
 ) -> None:
     """Blocking game-attract loop for a daemon thread: pulsing WIN + K plus twinkling stars.
 
-    Rebuilds and rewrites the full framebuffer every tick — ~8.3 MB per frame at
-    1080p — so the 0.4 s tick (~2.5 fps budget) keeps the Zero 2 W comfortable.
-    Without a usable fb0 this returns immediately; the TTY fallback never animates.
+    Rebuilds and rewrites the full framebuffer every tick into its native pixel
+    format (no conversion pass) — ~4.1 MB per frame at 1080p 16-bpp — so a 0.1 s
+    tick keeps the twinkle smooth on a Zero 2 W. Without a usable fb0 this returns
+    immediately; the TTY fallback never animates.
     """
     geometry = fb0_geometry()
     if geometry is None:
         return
-    width, height = geometry
-    field = StarField(width, height, rng if rng is not None else random.Random())
+    width, height, bpp = geometry
+    field = StarField(
+        width, height, rng if rng is not None else random.Random(), bpp=bpp
+    )
     t0 = time.monotonic()
 
     while not stop_event.is_set():
@@ -522,7 +554,7 @@ def run_splash_animation(
         phase = ((now - t0) / blink_period_s) % 1.0
         field.tick(now)
         canvas = build_fb_canvas(
-            state_factory(), width, height, phase=phase, starfield=field
+            state_factory(), width, height, phase=phase, starfield=field, bpp=bpp
         )
         try:
             with Path("/dev/fb0").open("r+b", buffering=0) as fb:
@@ -534,7 +566,7 @@ def run_splash_animation(
 
 
 def render_splash(state: SplashState, tty_path: Path = Path("/dev/tty1")) -> None:
-    """Render high-contrast color-block splash to `/dev/fb0` (if 32-bpp) or TTY1."""
+    """Render high-contrast color-block splash to `/dev/fb0` (16- or 32-bpp) or TTY1."""
     if _write_fb0_splash(state):
         return
     rendered = format_ansi_splash(state)
