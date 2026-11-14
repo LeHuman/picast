@@ -1,0 +1,30 @@
+# picast configuration (managed via `sudo picast configure`)
+[picast]
+device_name = picast
+transport_mode = both
+use_own_supplicant = true
+pin_mode = per-reboot
+fixed_pin = 12345670
+p2p_interface = wlan0
+p2p_ssid_postfix =
+wifi_band = auto
+ht40 = false
+wifi_power_save = false
+suppress_bg_scans = true
+max_resolution = 1920x1080
+max_fps = auto
+codec = auto
+decoder = auto
+jitter_ms = 45
+sync_mode = low-latency
+audio_enabled = true
+audio_codec = lpcm
+audio_sink = auto
+tcp_nodelay = true
+idr_on_loss = true
+kms_force_hdmi = false
+low_resource_mode = true
+rtsp_port = 7236
+mice_port = 7250
+rtp_port = 1028
+idr_ipc_port = 1029

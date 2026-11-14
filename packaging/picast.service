@@ -1,0 +1,32 @@
+[Unit]
+Description=picast Low-Latency Miracast & MICE Receiver
+Documentation=https://github.com/LeHuman/picast
+After=network-online.target NetworkManager.service systemd-user-sessions.service wpa_supplicant.service avahi-daemon.service
+Wants=network-online.target
+Conflicts=getty@tty1.service display-manager.service lightdm.service gdm3.service sddm.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/picast run
+# Hand the radio back to the system network stack however the service exits.
+ExecStopPost=-/usr/lib/picast/picast-restore-network.sh
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+RuntimeDirectory=picast
+StateDirectory=picast
+StandardInput=tty
+StandardOutput=tty
+# Python logging writes to stderr: keep it in the journal, not only on tty1.
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+OOMScoreAdjust=-500
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

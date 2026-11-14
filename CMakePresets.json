@@ -1,0 +1,95 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "26",
+        "PICAST_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (GCC 14 / C++26)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (GCC 14 / C++26 + LTO)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "rpi-arm64",
+      "displayName": "Raspberry Pi arm64 Release (Unified Zero 2 W / Pi 4 / Pi 5)",
+      "inherits": "release",
+      "cacheVariables": {
+        "PICAST_TARGET_CPU": "cortex-a53",
+        "PICAST_ENABLE_GSTREAMER": "ON"
+      }
+    },
+    {
+      "name": "rpi-pi5",
+      "displayName": "Raspberry Pi 5 Tuned arm64 Release (Cortex-A76)",
+      "inherits": "release",
+      "cacheVariables": {
+        "PICAST_TARGET_CPU": "cortex-a76",
+        "PICAST_ENABLE_GSTREAMER": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "rpi-arm64",
+      "configurePreset": "rpi-arm64"
+    },
+    {
+      "name": "rpi-pi5",
+      "configurePreset": "rpi-pi5"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "rpi-arm64",
+      "configurePreset": "rpi-arm64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "rpi-pi5",
+      "configurePreset": "rpi-pi5",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

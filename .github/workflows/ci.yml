@@ -1,0 +1,96 @@
+name: CI / Build & Package
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  service-qa:
+    name: Service Python 3.13 (Ruff, Mypy, Pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install QA dependencies
+        run: python -m pip install --upgrade pip ruff mypy pytest
+      - name: Run Ruff
+        run: ruff check src test
+      - name: Run Mypy (strict)
+        run: mypy
+      - name: Run Pytest
+        run: pytest
+
+  trixie-build:
+    name: Trixie C++26 + Service Build, Test & .deb Package
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            container_arch: linux/amd64
+            preset: release
+          - arch: arm64
+            container_arch: linux/arm64
+            preset: rpi-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU for arm64
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Build, Test, and Package inside Trixie (${{ matrix.arch }})
+        uses: addnab/docker-run-action@v3
+        with:
+          image: debian:trixie-slim
+          options: --platform ${{ matrix.container_arch }} -v ${{ github.workspace }}:/src -w /src
+          run: |
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              build-essential g++ cmake ninja-build pkg-config file dpkg-dev python3 python3-pytest \
+              libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libglib2.0-dev
+            # Verify standalone module build & test composability
+            cmake -S modules/rtp_jitter -B build/standalone-rtp -G Ninja -DPICAST_WARNINGS_AS_ERRORS=ON
+            cmake --build build/standalone-rtp -j"$(nproc)"
+            ctest --test-dir build/standalone-rtp --output-on-failure
+            # Full root Release + LTO build, all per-target CTests (C++ + service), and .deb
+            rm -rf build/${{ matrix.preset }} dist
+            cmake --preset ${{ matrix.preset }} -DPICAST_WARNINGS_AS_ERRORS=ON
+            cmake --build --preset ${{ matrix.preset }} -j"$(nproc)"
+            ctest --test-dir build/${{ matrix.preset }} --output-on-failure
+            mkdir -p dist
+            cpack --config build/${{ matrix.preset }}/CPackConfig.cmake -G DEB -B dist
+            dpkg-deb -I dist/picast_*.deb
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: picast-trixie-${{ matrix.arch }}-deb
+          path: dist/picast_*.deb
+
+  release:
+    name: Publish GitHub Release
+    needs: [service-qa, trixie-build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.deb
+          generate_release_notes: true

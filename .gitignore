@@ -1,7 +1,33 @@
-control/*.bin
-h264/h264.bin
-player/player.bin
-udhcpd.conf
-uuid.txt
-edid.txt
-nohup.out
+# Agent notes (local only; keep GOAL.md and PLAN.md tracked)
+.agent/*
+!.agent/GOAL.md
+!.agent/PLAN.md
+
+# Build & Packaging
+out/
+build/
+cmake-build-*/
+*.deb
+*.egg-info/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+compile_commands.json
+.vscode/*.local.json
+
+# Google AI Studio
+node_modules/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+bun.lock
+index.html
+metadata.json
+package.json
+tsconfig.json
+vite.config.ts

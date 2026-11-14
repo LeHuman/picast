@@ -1,0 +1,67 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "CMake: Configure (Debug)",
+      "type": "shell",
+      "command": "cmake --preset debug",
+      "windows": {
+        "command": "wsl cmake --preset debug"
+      },
+      "group": "build",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "CMake: Build & Test All Targets (Debug)",
+      "type": "shell",
+      "command": "cmake --build --preset debug && ctest --preset debug",
+      "windows": {
+        "command": "wsl bash -lc \"cmake --build --preset debug && ctest --preset debug\""
+      },
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "CMake: Build Raspberry Pi arm64 .deb (Native)",
+      "type": "shell",
+      "command": "cmake --preset rpi-arm64 && cmake --build --preset rpi-arm64 && cpack --config build/rpi-arm64/CPackConfig.cmake -G DEB -B dist",
+      "group": "build",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Docker: Build Raspberry Pi arm64 .deb (Trixie)",
+      "type": "shell",
+      "command": "docker run --rm --platform linux/arm64 -v \"${workspaceFolder}:/src\" -w /src debian:trixie-slim bash -lc \"apt-get update && apt-get install -y --no-install-recommends build-essential g++ cmake ninja-build pkg-config file dpkg-dev python3 python3-pytest libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libglib2.0-dev && cmake --preset rpi-arm64 && cmake --build --preset rpi-arm64 -j && ctest --preset rpi-arm64 && cpack --config build/rpi-arm64/CPackConfig.cmake -G DEB -B dist\"",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Service Python: Lint, Typecheck & Pytest",
+      "type": "shell",
+      "options": {
+        "cwd": "${workspaceFolder}/service"
+      },
+      "command": "python3 -m ruff check src test && python3 -m mypy && python3 -m pytest",
+      "windows": {
+        "command": "python -m ruff check src test && python -m mypy && python -m pytest"
+      },
+      "group": "test"
+    },
+    {
+      "label": "Deploy .deb to Raspberry Pi (SSH)",
+      "type": "shell",
+      "command": "scp dist/picast-*.deb ${input:piTarget}:/tmp/ && ssh ${input:piTarget} \"sudo apt install -y /tmp/picast-*.deb\"",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "piTarget",
+      "type": "promptString",
+      "description": "SSH target user@host for Raspberry Pi deployment (e.g. pi@raspberrypi.local)"
+    }
+  ]
+}
