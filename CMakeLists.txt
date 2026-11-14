@@ -40,13 +40,6 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/packaging/picast.conf.default"
 install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/picast-restore-network.sh"
     DESTINATION "/usr/lib/picast"
 )
-install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/picast-watchdog.sh"
-    DESTINATION "/usr/lib/picast"
-)
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/packaging/picast-watchdog.service"
-    "${CMAKE_CURRENT_SOURCE_DIR}/packaging/picast-watchdog.timer"
-    DESTINATION "/lib/systemd/system"
-)
 
 set(CPACK_GENERATOR "DEB")
 set(CPACK_PACKAGE_NAME "picast")

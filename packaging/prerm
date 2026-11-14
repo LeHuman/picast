@@ -3,9 +3,9 @@ set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop picast.service picast-watchdog.timer picast-watchdog.service >/dev/null 2>&1 || true
+        systemctl stop picast.service >/dev/null 2>&1 || true
         if [ "$1" = "remove" ]; then
-            systemctl disable picast.service picast-watchdog.timer >/dev/null 2>&1 || true
+            systemctl disable picast.service >/dev/null 2>&1 || true
         fi
     fi
 fi

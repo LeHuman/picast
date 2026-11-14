@@ -1,7 +1,0 @@
-[Unit]
-Description=picast network lockout watchdog
-After=picast.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/lib/picast/picast-watchdog.sh
