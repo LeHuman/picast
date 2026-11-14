@@ -51,31 +51,43 @@ DecoderBackend resolve_video_decoder(
 
 namespace {
 
+/** @brief Historical `tsdemux`/`rtpjitterbuffer` latency used when no explicit override is set. */
+constexpr std::uint16_t kDefaultTsdemuxLatencyMs = 45U;
+
 [[nodiscard]] std::string build_video_decoder_chain(DecoderBackend decoder) {
     // Explicit video/* caps BEFORE `queue` are mandatory: `queue` has `ANY`
     // sink caps, so without a media-type filter `gst_parse_launch` links
     // `tsdemux`'s dynamic audio pad to the video queue whenever PMT/PES
     // declares audio first, causing `streaming stopped, reason not-linked (-1)`.
+    // The pre-decode `queue` is explicitly bounded (12 buffers, no byte/time
+    // caps) so compressed frames never accumulate to GStreamer's default
+    // 200-buffer / 1 s limits during Wi-Fi bursts.
     switch (decoder) {
         case DecoderBackend::V4l2H264M2M:
-            // Non-leaky pre-decode queue + config-interval=-1 + caps normalization +
-            // DMA-BUF capture-io-mode=4. On RPi Trixie (`bcm2835-codec`), `v4l2h264dec`
-            // omits `constrained-high`/`progressive-high` from its V4L2 profile menu and
-            // rejects non-YUV VUI colorimetries (`sRGB`), even though WFD Constrained High
-            // Profile (0x02) is a strict subset of High Profile decoded natively by VC4.
-            return "video/x-h264 ! queue ! h264parse config-interval=-1 ! "
+            // Non-leaky bounded pre-decode queue + config-interval=-1 + caps
+            // normalization + DMA-BUF capture-io-mode=4. On RPi Trixie
+            // (`bcm2835-codec`), `v4l2h264dec` omits `constrained-high`/
+            // `progressive-high` from its V4L2 profile menu and rejects
+            // non-YUV VUI colorimetries (`sRGB`), even though WFD Constrained
+            // High Profile (0x02) is a strict subset of High Profile decoded
+            // natively by VC4.
+            return "video/x-h264 ! queue max-size-buffers=12 max-size-bytes=0 max-size-time=0 ! "
+                   "h264parse config-interval=-1 ! "
                    "video/x-h264,stream-format=byte-stream,alignment=au ! "
                    "capssetter join=true replace=false "
                    "caps=\"video/x-h264,profile=(string)high,colorimetry=(string)bt709\" ! "
                    "v4l2h264dec capture-io-mode=4";
         case DecoderBackend::V4l2HevcStateless:
-            return "video/x-h265 ! queue ! h265parse config-interval=-1 ! v4l2slh265dec";
+            return "video/x-h265 ! queue max-size-buffers=12 max-size-bytes=0 max-size-time=0 ! "
+                   "h265parse config-interval=-1 ! v4l2slh265dec";
         case DecoderBackend::SoftwareHevc:
-            return "video/x-h265 ! queue ! h265parse config-interval=-1 ! avdec_h265 max-threads=0";
+            return "video/x-h265 ! queue max-size-buffers=12 max-size-bytes=0 max-size-time=0 ! "
+                   "h265parse config-interval=-1 ! avdec_h265 max-threads=0";
         case DecoderBackend::SoftwareNeonH264:
         case DecoderBackend::Auto:
         default:
-            return "video/x-h264 ! queue ! h264parse config-interval=-1 ! avdec_h264 max-threads=0";
+            return "video/x-h264 ! queue max-size-buffers=12 max-size-bytes=0 max-size-time=0 ! "
+                   "h264parse config-interval=-1 ! avdec_h264 max-threads=0";
     }
 }
 
@@ -105,26 +117,31 @@ std::string build_gstreamer_pipeline_description(
     const std::string sync_flag = cfg.low_latency_sync ? "false" : "true";
     const std::string video_chain = build_video_decoder_chain(decoder);
 
-    std::string kms_props = std::format("driver-name=vc4 sync={}", sync_flag);
-    if (!cfg.drm_connector.empty()) {
-        kms_props += " can-scale=true";
-    }
+    // `kmssink` defaults to `can-scale=true`, so no explicit property is needed.
+    const std::string kms_props = std::format("driver-name=vc4 sync={}", sync_flag);
 
     std::string source_stage;
     if (use_appsrc) {
+        // `RtpJitterBuffer` already reorders out-of-order UDP RTP upstream, so
+        // `tsdemux` adds no demux-side latency unless explicitly overridden
+        // (the app defaults `ts_demux_latency_ms` to 0 for this path).
         source_stage = std::format(
             "appsrc name=ts_src is-live=true do-timestamp=true format=time block=false "
             "caps=video/mpegts,systemstream=true,packetsize=188 ! "
             "tsdemux name=demux latency={}",
             cfg.ts_demux_latency_ms);
     } else {
+        // Direct `udpsrc` path has no upstream jitter buffer of our own, so
+        // fall back to the historical 45 ms `rtpjitterbuffer`/`tsdemux` latency.
+        const std::uint16_t latency_ms =
+            cfg.ts_demux_latency_ms > 0U ? cfg.ts_demux_latency_ms : kDefaultTsdemuxLatencyMs;
         source_stage = std::format(
             "udpsrc port={} buffer-size=4194304 ! "
             "rtpjitterbuffer latency={} drop-on-latency=false do-lost=true faststart-min-packets=2 ! "
             "rtpmp2tdepay ! tsdemux name=demux latency={}",
             udp_port,
-            cfg.ts_demux_latency_ms,
-            cfg.ts_demux_latency_ms);
+            latency_ms,
+            latency_ms);
     }
 
     std::string pipeline = std::format(

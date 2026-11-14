@@ -109,6 +109,7 @@ void RtpJitterBuffer::reset() noexcept {
     occupied_ = 0U;
     initialized_ = false;
     next_expected_seq_ = 0U;
+    earliest_seq_ = 0U;
     last_idr_request_ = {};
     stats_ = {};
 }
@@ -157,6 +158,9 @@ bool RtpJitterBuffer::push_datagram(
             }
         }
         next_expected_seq_ = new_base;
+        if (occupied_ > 0U) {
+            recompute_earliest();  // Rare far-jump path: the tracked earliest may be evicted.
+        }
         maybe_trigger_idr(now);
     }
 
@@ -166,6 +170,7 @@ bool RtpJitterBuffer::push_datagram(
 
     const std::size_t idx = static_cast<std::size_t>(pkt.sequence_number) % config_.capacity_packets;
     auto& slot = ring_[idx];
+    bool overwrote_earliest = false;
     if (slot.occupied) {
         if (slot.seq == pkt.sequence_number) {
             ++stats_.packets_dropped_duplicate;
@@ -173,6 +178,7 @@ bool RtpJitterBuffer::push_datagram(
         }
         --occupied_;
         ++stats_.sequence_gaps;
+        overwrote_earliest = (slot.seq == earliest_seq_);
     }
 
     slot.occupied = true;
@@ -181,10 +187,34 @@ bool RtpJitterBuffer::push_datagram(
     slot.arrived_at = now;
     std::copy(pkt.payload.begin(), pkt.payload.end(), slot.payload.begin());
     ++occupied_;
+
+    if (occupied_ == 1U) {
+        earliest_seq_ = pkt.sequence_number;
+    } else if (seq_before(pkt.sequence_number, earliest_seq_)) {
+        earliest_seq_ = pkt.sequence_number;
+    }
+    if (overwrote_earliest) {
+        recompute_earliest();  // Rare same-slot overwrite of the tracked earliest packet.
+    }
     return true;
 }
 
-std::optional<std::size_t> RtpJitterBuffer::find_earliest_occupied_index() const noexcept {
+void RtpJitterBuffer::advance_earliest_from(std::size_t vacated_idx) noexcept {
+    // Forward ring order equals increasing sequence order (slot `i` maps to
+    // `earliest + k` within the active wrap window), so the first occupied slot
+    // found is the exact new minimum. The common in-order case hits `k == 1`.
+    const std::size_t cap = config_.capacity_packets;
+    for (std::size_t k = 1U; k < cap; ++k) {
+        const std::size_t idx = (vacated_idx + k) % cap;
+        if (ring_[idx].occupied) {
+            earliest_seq_ = ring_[idx].seq;
+            return;
+        }
+    }
+    earliest_seq_ = next_expected_seq_;  // Defensive fallback; unreachable while occupied_ > 0.
+}
+
+void RtpJitterBuffer::recompute_earliest() noexcept {
     std::optional<std::size_t> best;
     for (std::size_t i = 0U; i < ring_.size(); ++i) {
         if (!ring_[i].occupied) {
@@ -194,7 +224,7 @@ std::optional<std::size_t> RtpJitterBuffer::find_earliest_occupied_index() const
             best = i;
         }
     }
-    return best;
+    earliest_seq_ = best.has_value() ? ring_[*best].seq : next_expected_seq_;
 }
 
 void RtpJitterBuffer::maybe_trigger_idr(std::chrono::steady_clock::time_point now) noexcept {
@@ -220,8 +250,8 @@ std::optional<std::size_t> RtpJitterBuffer::pop_ready_into(
         return std::nullopt;
     }
 
-    const std::size_t head_idx =
-        static_cast<std::size_t>(next_expected_seq_) % config_.capacity_packets;
+    const std::size_t cap = config_.capacity_packets;
+    const std::size_t head_idx = static_cast<std::size_t>(next_expected_seq_) % cap;
     if (ring_[head_idx].occupied && ring_[head_idx].seq == next_expected_seq_) {
         const std::size_t len = ring_[head_idx].length;
         std::copy_n(ring_[head_idx].payload.begin(), len, out_buf.begin());
@@ -229,33 +259,68 @@ std::optional<std::size_t> RtpJitterBuffer::pop_ready_into(
         ring_[head_idx].length = 0U;
         --occupied_;
         next_expected_seq_ = static_cast<std::uint16_t>(next_expected_seq_ + 1U);
+        if (occupied_ > 0U) {
+            advance_earliest_from(head_idx);
+        } else {
+            earliest_seq_ = next_expected_seq_;
+        }
         ++stats_.packets_emitted;
         return len;
     }
 
-    const auto earliest = find_earliest_occupied_index();
-    if (!earliest.has_value()) {
+    std::size_t earliest_idx = static_cast<std::size_t>(earliest_seq_) % cap;
+    if (!ring_[earliest_idx].occupied || ring_[earliest_idx].seq != earliest_seq_) {
+        // Defensive: tracking invariant violation (should not happen).
+        recompute_earliest();
+        if (occupied_ == 0U) {
+            return std::nullopt;
+        }
+        earliest_idx = static_cast<std::size_t>(earliest_seq_) % cap;
+    }
+
+    auto& earliest = ring_[earliest_idx];
+    const auto elapsed = now - earliest.arrived_at;
+    if (elapsed < config_.max_hold_time && occupied_ < (cap / 2U)) {
         return std::nullopt;
     }
 
-    const auto elapsed = now - ring_[*earliest].arrived_at;
-    if (elapsed < config_.max_hold_time && occupied_ < (config_.capacity_packets / 2U)) {
-        return std::nullopt;
-    }
-
-    const std::uint16_t missing_span = seq_distance(next_expected_seq_, ring_[*earliest].seq);
+    const std::uint16_t missing_span = seq_distance(next_expected_seq_, earliest_seq_);
     stats_.sequence_gaps += missing_span;
     maybe_trigger_idr(now);
 
-    const std::size_t len = ring_[*earliest].length;
-    const std::uint16_t seq = ring_[*earliest].seq;
-    std::copy_n(ring_[*earliest].payload.begin(), len, out_buf.begin());
-    ring_[*earliest].occupied = false;
-    ring_[*earliest].length = 0U;
+    const std::size_t len = earliest.length;
+    const std::uint16_t seq = earliest.seq;
+    std::copy_n(earliest.payload.begin(), len, out_buf.begin());
+    earliest.occupied = false;
+    earliest.length = 0U;
     --occupied_;
     next_expected_seq_ = static_cast<std::uint16_t>(seq + 1U);
+    if (occupied_ > 0U) {
+        advance_earliest_from(earliest_idx);
+    } else {
+        earliest_seq_ = next_expected_seq_;
+    }
     ++stats_.packets_emitted;
     return len;
+}
+
+std::optional<std::chrono::steady_clock::time_point> RtpJitterBuffer::next_deadline() const noexcept {
+    if (!initialized_ || occupied_ == 0U) {
+        return std::nullopt;
+    }
+
+    const std::size_t head_idx =
+        static_cast<std::size_t>(next_expected_seq_) % config_.capacity_packets;
+    if (ring_[head_idx].occupied && ring_[head_idx].seq == next_expected_seq_) {
+        return std::nullopt;  // In-order packet ready for immediate emission.
+    }
+
+    const std::size_t earliest_idx =
+        static_cast<std::size_t>(earliest_seq_) % config_.capacity_packets;
+    if (!ring_[earliest_idx].occupied || ring_[earliest_idx].seq != earliest_seq_) {
+        return std::nullopt;  // Defensive: tracking invariant violation.
+    }
+    return ring_[earliest_idx].arrived_at + config_.max_hold_time;
 }
 
 }  // namespace picast

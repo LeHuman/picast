@@ -45,10 +45,39 @@ void test_valid_cli_arguments() {
         EXPECT_TRUE(parsed->rtp_port == 1030U);
         EXPECT_TRUE(parsed->idr_port == 1031U);
         EXPECT_TRUE(parsed->jitter_ms == 60U);
+        // `--latency-ms` tunes the jitter buffer only: tsdemux latency stays 0
+        // so the 45 ms hold is not double-buffered into the pipeline as well.
+        EXPECT_TRUE(parsed->pipeline.ts_demux_latency_ms == 0U);
         EXPECT_TRUE(parsed->pipeline.video_codec == picast::VideoCodec::H265);
         EXPECT_TRUE(!parsed->pipeline.low_latency_sync);
         EXPECT_TRUE(parsed->pipeline.audio_sink == picast::AudioSinkKind::PipeWire);
         EXPECT_TRUE(parsed->pipeline.dry_run);
+    }
+}
+
+void test_ts_demux_latency_defaults_to_zero_and_override_flag() {
+    const std::array defaults{"picast-player"};
+    const auto parsed = picast::parse_app_args(defaults);
+    EXPECT_TRUE(parsed.has_value());
+    if (parsed.has_value()) {
+        EXPECT_TRUE(parsed->jitter_ms == 45U);
+        EXPECT_TRUE(parsed->pipeline.ts_demux_latency_ms == 0U);
+    }
+
+    const std::array override_argv{"picast-player", "--ts-demux-latency-ms", "120"};
+    const auto overridden = picast::parse_app_args(override_argv);
+    EXPECT_TRUE(overridden.has_value());
+    if (overridden.has_value()) {
+        EXPECT_TRUE(overridden->pipeline.ts_demux_latency_ms == 120U);
+        EXPECT_TRUE(overridden->jitter_ms == 45U);  // Independent of --ts-demux-latency-ms.
+    }
+
+    const std::array both_argv{"picast-player", "--latency-ms", "30", "--ts-demux-latency-ms", "15"};
+    const auto both = picast::parse_app_args(both_argv);
+    EXPECT_TRUE(both.has_value());
+    if (both.has_value()) {
+        EXPECT_TRUE(both->jitter_ms == 30U);
+        EXPECT_TRUE(both->pipeline.ts_demux_latency_ms == 15U);
     }
 }
 
@@ -67,6 +96,7 @@ void test_invalid_cli_arguments_return_error() {
 
 int main() {
     test_valid_cli_arguments();
+    test_ts_demux_latency_defaults_to_zero_and_override_flag();
     test_invalid_cli_arguments_return_error();
 
     if (g_failures > 0) {

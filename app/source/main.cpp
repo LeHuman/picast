@@ -10,9 +10,11 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -127,11 +129,9 @@ int main(int argc, char* argv[]) {
         int rcvbuf = 4 * 1024 * 1024;
         (void)setsockopt(rtp_sock.get(), SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-        // 20 ms recv timeout keeps jitter hold expiry prompt without busy-waiting.
-        timeval tv{};
-        tv.tv_sec = 0;
-        tv.tv_usec = 20000;
-        (void)setsockopt(rtp_sock.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        // `poll()` with a dynamic timeout replaces the fixed 20 ms `SO_RCVTIMEO`:
+        // the timeout is derived from the jitter buffer's next hold deadline so
+        // gap expiry stays prompt without busy-waiting.
 
         sockaddr_in bind_addr{};
         bind_addr.sin_family = AF_INET;
@@ -168,25 +168,63 @@ int main(int argc, char* argv[]) {
             [&]() { picast::send_udp_signal(idr_sock.get(), cfg.idr_port, "idr_request"); });
 
         std::array<std::uint8_t, 2048> rx_buf{};
+        constexpr int kIdlePollTimeoutMs = 100;    // Idle: still poll signals & GStreamer bus.
+        constexpr int kGapPollMinMs = 1;           // Gap wait: never spin below 1 ms.
+        constexpr int kGapPollMaxMs = 20;          // Gap wait: cap hold-deadline sleeps.
+        constexpr int kMaxBurstDatagrams = 64;     // Non-blocking burst drain per wakeup.
         while (!picast::g_stop_requested.load(std::memory_order_relaxed)) {
-            const ssize_t n = recv(rtp_sock.get(), rx_buf.data(), rx_buf.size(), 0);
             const auto now = std::chrono::steady_clock::now();
-            if (n > 0) {
-                (void)jitter.push_datagram(
-                    std::span<const std::uint8_t>{rx_buf.data(), static_cast<std::size_t>(n)},
-                    now);
-            } else if (n < 0) {
-                const int err = errno;
-                if (err != EAGAIN && err != EWOULDBLOCK && err != EINTR) {
+            int poll_timeout_ms = kIdlePollTimeoutMs;
+            if (const auto deadline = jitter.next_deadline()) {
+                const auto remaining_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now)
+                        .count();
+                poll_timeout_ms = std::clamp(
+                    static_cast<int>(remaining_ms), kGapPollMinMs, kGapPollMaxMs);
+            }
+
+            pollfd pfd{};
+            pfd.fd = rtp_sock.get();
+            pfd.events = POLLIN;
+            const int ready = ::poll(&pfd, 1, poll_timeout_ms);
+            if (ready < 0 && errno != EINTR) {
+                std::cerr << std::format(
+                    "[picast-player] ERROR UDP poll failed: {}\n", std::strerror(errno));
+                picast::send_udp_signal(idr_sock.get(), cfg.idr_port, "recv error");
+                break;
+            }
+
+            // Burst-drain queued datagrams non-blockingly so kernel-side
+            // queueing never outpaces the jitter buffer during Wi-Fi bursts.
+            bool socket_error = false;
+            for (int burst = 0; burst < kMaxBurstDatagrams; ++burst) {
+                const ssize_t n =
+                    recv(rtp_sock.get(), rx_buf.data(), rx_buf.size(), MSG_DONTWAIT);
+                if (n < 0) {
+                    const int err = errno;
+                    if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) {
+                        break;
+                    }
                     std::cerr << std::format(
                         "[picast-player] ERROR UDP recv failed: {}\n", std::strerror(err));
                     picast::send_udp_signal(idr_sock.get(), cfg.idr_port, "recv error");
+                    socket_error = true;
                     break;
                 }
+                if (n == 0) {
+                    continue;  // Zero-length datagram: nothing to parse.
+                }
+                (void)jitter.push_datagram(
+                    std::span<const std::uint8_t>{rx_buf.data(), static_cast<std::size_t>(n)},
+                    std::chrono::steady_clock::now());
             }
-            (void)jitter.drain([&](std::span<const std::uint8_t> ts_chunk) {
+            if (socket_error) {
+                break;
+            }
+
+            (void)jitter.drain_coalesced([&](std::span<const std::uint8_t> ts_chunk) {
                 (void)pipeline.push_mpegts(ts_chunk);
-            }, now);
+            }, std::chrono::steady_clock::now());
             pipeline.poll_events();
         }
 

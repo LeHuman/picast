@@ -77,11 +77,55 @@ void test_dry_run_pipeline_lifecycle() {
     EXPECT_TRUE(!pipe.is_running());
 }
 
+void test_latency_defaults_and_queue_bounds() {
+    picast::HardwareCapabilities caps;
+    caps.board = picast::PiBoardModel::PiZero2W;
+    caps.has_v4l2_h264_m2m = true;
+
+    picast::PipelineConfig cfg;
+    // appsrc mode uses `cfg.ts_demux_latency_ms` verbatim (struct default 45 ms):
+    // the app-level jitter buffer already reorders UDP RTP, and the app defaults
+    // this to 0 unless explicitly overridden via `--ts-demux-latency-ms`.
+    const auto appsrc_pipe = picast::build_gstreamer_pipeline_description(cfg, caps, true);
+    EXPECT_TRUE(appsrc_pipe.find("appsrc name=ts_src") != std::string::npos);
+    EXPECT_TRUE(appsrc_pipe.find("tsdemux name=demux latency=45") != std::string::npos);
+    // Pre-decode compressed-frame queue must be bounded (no 200-buffer / 1 s defaults).
+    EXPECT_TRUE(appsrc_pipe.find("queue max-size-buffers=12 max-size-bytes=0 max-size-time=0")
+                != std::string::npos);
+    // Post-decode queue stays leaky with the 2-buffer bound before kmssink.
+    EXPECT_TRUE(appsrc_pipe.find("queue leaky=downstream max-size-buffers=2 ! kmssink")
+                != std::string::npos);
+
+    cfg.ts_demux_latency_ms = 0U;
+    const auto zero_latency =
+        picast::build_gstreamer_pipeline_description(cfg, caps, true);
+    EXPECT_TRUE(zero_latency.find("tsdemux name=demux latency=0") != std::string::npos);
+
+    // Direct udpsrc path falls back to the historical 45 ms latency when unset.
+    const auto udpsrc_zero = picast::build_gstreamer_pipeline_description(cfg, caps, false, 1028U);
+    EXPECT_TRUE(udpsrc_zero.find("rtpjitterbuffer latency=45") != std::string::npos);
+    EXPECT_TRUE(udpsrc_zero.find("tsdemux name=demux latency=45") != std::string::npos);
+
+    // Explicit override propagates to both rtpjitterbuffer and tsdemux.
+    cfg.ts_demux_latency_ms = 120U;
+    const auto udpsrc_override =
+        picast::build_gstreamer_pipeline_description(cfg, caps, false, 1028U);
+    EXPECT_TRUE(udpsrc_override.find("rtpjitterbuffer latency=120") != std::string::npos);
+    EXPECT_TRUE(udpsrc_override.find("tsdemux name=demux latency=120") != std::string::npos);
+
+    // `kmssink` already defaults `can-scale=true`; the dead drm_connector branch is gone.
+    cfg.drm_connector = "card0-HDMI-A-1";
+    const auto no_can_scale =
+        picast::build_gstreamer_pipeline_description(cfg, caps, true);
+    EXPECT_TRUE(no_can_scale.find("can-scale") == std::string::npos);
+}
+
 }  // namespace
 
 int main() {
     test_decoder_and_pipeline_selection();
     test_dry_run_pipeline_lifecycle();
+    test_latency_defaults_and_queue_bounds();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " assertion(s) failed.\n";

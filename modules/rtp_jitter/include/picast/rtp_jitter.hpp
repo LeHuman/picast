@@ -24,6 +24,9 @@ inline constexpr std::size_t kMaxRtpPayloadBytes = 1500U;
 /** @brief Default circular jitter ring capacity in packets. */
 inline constexpr std::size_t kDefaultJitterCapacity = 256U;
 
+/** @brief Maximum accumulated MPEG-TS bytes emitted per `drain_coalesced()` burst chunk. */
+inline constexpr std::size_t kCoalesceChunkBytes = 32768U;
+
 /** @brief Zero-copy view of a parsed RFC 3550 RTP datagram. */
 struct RtpPacketView {
     bool marker{false};
@@ -140,6 +143,54 @@ public:
     /** @brief Return current number of buffered packets awaiting emission. */
     [[nodiscard]] std::size_t occupied() const noexcept { return occupied_; }
 
+    /**
+     * @brief Drain all currently ready payloads coalesced into ≤32 KiB burst chunks.
+     *
+     * Consecutive ready MPEG-TS payloads are concatenated into a single stack
+     * scratch buffer and flushed through `on_chunk` once per burst, cutting the
+     * per-packet `gst_buffer_new_allocate` + `gst_app_src_push_buffer` overhead
+     * by 5-10x on the `appsrc` hot path. A flush happens eagerly when appending
+     * the next packet would exceed `kCoalesceChunkBytes`.
+     * @tparam Callback Callable accepting `std::span<const std::uint8_t>`.
+     * @param on_chunk Invoked once per accumulated burst (never with an empty span).
+     * @param now Current monotonic clock time.
+     * @return Count of packets drained (and coalesced) during this call.
+     */
+    template <typename Callback>
+    std::size_t drain_coalesced(
+        Callback&& on_chunk,
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) noexcept {
+        std::array<std::uint8_t, kCoalesceChunkBytes> burst{};
+        std::array<std::uint8_t, kMaxRtpPayloadBytes> staging{};
+        std::size_t packets = 0U;
+        std::size_t filled = 0U;
+        while (const auto len = pop_ready_into(staging, now)) {
+            if (filled > 0U && (filled + *len) > burst.size()) {
+                on_chunk(std::span<const std::uint8_t>{burst.data(), filled});
+                filled = 0U;
+            }
+            std::copy_n(staging.begin(), *len, burst.begin() + filled);
+            filled += *len;
+            ++packets;
+        }
+        if (filled > 0U) {
+            on_chunk(std::span<const std::uint8_t>{burst.data(), filled});
+        }
+        return packets;
+    }
+
+    /**
+     * @brief Report the monotonic deadline when the earliest held packet is force-emitted.
+     *
+     * Returns `ring_[earliest].arrived_at + max_hold_time` while a sequence gap
+     * blocks in-order emission (`occupied_ > 0` and the packet at
+     * `next_expected_seq_` is still missing), so the UDP event loop can sleep
+     * exactly until the hold deadline. Returns `std::nullopt` when the buffer is
+     * empty or the head packet is already ready for immediate emission.
+     * @return Hold-expiry deadline, or `std::nullopt` when empty/ready.
+     */
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> next_deadline() const noexcept;
+
 private:
     struct Slot {
         bool occupied{false};
@@ -149,7 +200,11 @@ private:
         std::array<std::uint8_t, kMaxRtpPayloadBytes> payload{};
     };
 
-    [[nodiscard]] std::optional<std::size_t> find_earliest_occupied_index() const noexcept;
+    /** @brief Advance `earliest_seq_` to the next occupied slot in ring order after a pop. */
+    void advance_earliest_from(std::size_t vacated_idx) noexcept;
+
+    /** @brief Full-ring recompute of `earliest_seq_` (rare paths: eviction, slot overwrite). */
+    void recompute_earliest() noexcept;
     void maybe_trigger_idr(std::chrono::steady_clock::time_point now) noexcept;
 
     JitterConfig config_{};
@@ -158,6 +213,14 @@ private:
     std::size_t occupied_{0U};
     bool initialized_{false};
     std::uint16_t next_expected_seq_{0U};
+    /**
+     * @brief Lowest occupied sequence number; valid only while `occupied_ > 0`.
+     *
+     * Kept in O(1) on the hot paths: advanced incrementally past vacated slots
+     * on pop, updated on out-of-order push, and recomputed via a full-ring scan
+     * only on rare paths (capacity eviction, same-slot overwrite).
+     */
+    std::uint16_t earliest_seq_{0U};
     std::chrono::steady_clock::time_point last_idr_request_{};
     JitterStats stats_{};
 };

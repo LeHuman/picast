@@ -29,6 +29,13 @@ namespace {
 
 std::expected<AppConfig, std::string> parse_app_args(std::span<const char* const> args) {
     AppConfig cfg;
+    // `RtpJitterBuffer` already reorders out-of-order UDP RTP before `appsrc`,
+    // so `tsdemux` adds no demux-side buffering by default. Historically
+    // `--latency-ms` double-buffered the value into BOTH the jitter buffer and
+    // `tsdemux` (45 ms became 90 ms of glass-to-glass delay); it now tunes the
+    // jitter buffer only, and `--ts-demux-latency-ms` provides an explicit
+    // override (e.g. for the direct `udpsrc` pipeline path).
+    cfg.pipeline.ts_demux_latency_ms = 0U;
     for (std::size_t i = 1U; i < args.size(); ++i) {
         const std::string_view arg = args[i];
         auto next_arg = [&](std::string_view flag) -> std::expected<std::string_view, std::string> {
@@ -66,6 +73,11 @@ std::expected<AppConfig, std::string> parse_app_args(std::span<const char* const
             const auto ms = parse_u16(*val);
             if (!ms) return std::unexpected(ms.error());
             cfg.jitter_ms = *ms;
+        } else if (arg == "--ts-demux-latency-ms") {
+            const auto val = next_arg(arg);
+            if (!val) return std::unexpected(val.error());
+            const auto ms = parse_u16(*val);
+            if (!ms) return std::unexpected(ms.error());
             cfg.pipeline.ts_demux_latency_ms = *ms;
         } else if (arg == "--codec") {
             const auto val = next_arg(arg);
