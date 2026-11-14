@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import random
 import socket
 import stat
 import threading
@@ -42,8 +44,15 @@ from src.rtsp_session import (
     parse_uibc_port,
 )
 from src.splash import (
+    _FB_DEVICE_COLOR,
+    _FB_STAR_COLOR,
     PinManager,
     SplashState,
+    Star,
+    StarField,
+    _fb_background,
+    _scale_color,
+    build_fb_canvas,
     format_ansi_splash,
     generate_wps_pin,
     render_color_block_text,
@@ -256,10 +265,207 @@ def test_pin_per_reboot_persistence_and_splash(tmp_path: Path) -> None:
             status_line="READY",
         )
     )
-    assert "PICAST" in ansi
+    assert "P I C A S T" in ansi
+    assert "LIVINGROOM" in ansi
+    assert "READY" in ansi
+    assert "P2P + MICE" in ansi
     # The PIN is rendered as 7-row color-block glyphs, not literal digits.
-    pin_blocks = render_color_block_text(f"{p1[:4]} {p1[4:]}", fg_code="93")
+    pin_blocks = render_color_block_text(f"{p1[:4]} {p1[4:]}", fg_code="38;2;255;210;82")
     assert all(row in ansi for row in pin_blocks)
+
+
+_FB_BG_PIXEL = b"\x1a\x12\x0c\xff"
+_FB_AMBER_PIXEL = b"\x52\xd2\xff\xff"
+_FB_WHITE_PIXEL = b"\xf4\xed\xe8\xff"
+_FB_SLATE_PIXEL = b"\xb8\xa3\x94\xff"
+_FB_DIM_PIXEL = b"\x76\x66\x5a\xff"
+
+
+def _splash_canvas_state() -> SplashState:
+    return SplashState(
+        device_name="LIVINGROOM",
+        transport_label="P2P + MICE",
+        pin_display="12345678",
+        status_line="READY",
+    )
+
+
+def _pixel_at(canvas: bytearray, width: int, x: int, y: int) -> bytes:
+    off = (y * width + x) * 4
+    return bytes(canvas[off : off + 4])
+
+
+def _row_has(canvas: bytearray, width: int, y: int, pixel: bytes) -> bool:
+    row = canvas[y * width * 4 : (y + 1) * width * 4]
+    return pixel in row
+
+
+def test_build_fb_canvas_geometry_and_palette_1080p() -> None:
+    canvas = build_fb_canvas(_splash_canvas_state(), 1920, 1080)
+    assert len(canvas) == 1920 * 1080 * 4
+
+    # Deep charcoal-navy field, no muddy brown remnants.
+    assert _pixel_at(canvas, 1920, 0, 0) == _FB_BG_PIXEL
+    assert _pixel_at(canvas, 1920, 1919, 1079) == _FB_BG_PIXEL
+    assert _FB_BG_PIXEL in canvas[:1920]
+
+    # Amber lives in the top third (accent rule) and middle band (PIN hero).
+    assert any(_row_has(canvas, 1920, y, _FB_AMBER_PIXEL) for y in range(0, 1080 // 3))
+    assert any(
+        _row_has(canvas, 1920, y, _FB_AMBER_PIXEL) for y in range(1080 // 3, 2 * 1080 // 3)
+    )
+    # Warm-white device name in the lower-middle band.
+    assert any(
+        _row_has(canvas, 1920, y, _FB_WHITE_PIXEL) for y in range(1080 // 2, 3 * 1080 // 4)
+    )
+    # Muted-slate status in the bottom quarter.
+    assert any(
+        _row_has(canvas, 1920, y, _FB_SLATE_PIXEL) for y in range(3 * 1080 // 4, 1080)
+    )
+    # Dim wordmark in the top area.
+    assert any(_row_has(canvas, 1920, y, _FB_DIM_PIXEL) for y in range(0, 1080 // 3))
+    # Hero is by far the most present color on screen.
+    assert canvas.count(_FB_AMBER_PIXEL) > canvas.count(_FB_WHITE_PIXEL)
+    assert canvas.count(_FB_AMBER_PIXEL) > canvas.count(_FB_SLATE_PIXEL)
+
+
+@pytest.mark.parametrize(
+    ("width", "height"), [(640, 480), (1280, 720), (1920, 1080)]
+)
+def test_build_fb_canvas_scales_across_resolutions(width: int, height: int) -> None:
+    canvas = build_fb_canvas(_splash_canvas_state(), width, height)
+    assert len(canvas) == width * height * 4
+    assert _pixel_at(canvas, width, 0, 0) == _FB_BG_PIXEL
+    assert _pixel_at(canvas, width, width - 1, height - 1) == _FB_BG_PIXEL
+    # PIN hero and status must survive every supported resolution.
+    assert any(
+        _row_has(canvas, width, y, _FB_AMBER_PIXEL) for y in range(height // 3, 2 * height // 3)
+    )
+    assert any(
+        _row_has(canvas, width, y, _FB_SLATE_PIXEL) for y in range(3 * height // 4, height)
+    )
+
+
+def test__scale_color_identity_half_clamp_alpha() -> None:
+    # A factor near 1.0 must be (visually) identity.
+    amber = _scale_color(b"\x52\xd2\xff\xff", 1.0)
+    assert amber == b"\x52\xd2\xff\xff"
+    # 0.5 halves every RGB channel; alpha untouched.
+    assert _scale_color(b"\x52\xd2\xff\xff", 0.5) == b"\x29\x69\x80\xff"
+    # Clamping at 255 for overflow.
+    assert _scale_color(b"\xff\xff\xff\xff", 2.0) == b"\xff\xff\xff\xff"
+    # 0 factor zeroes RGB, keeps alpha.
+    assert _scale_color(b"\x52\xd2\xff\xff", 0.0) == b"\x00\x00\x00\xff"
+
+
+def test_build_fb_canvas_blink_phase() -> None:
+    """Phase 0.0 vs 0.5 with no stars: canvases differ; only the WIN+K band changes."""
+    state = _splash_canvas_state()
+    bright = build_fb_canvas(state, 1280, 720, phase=0.0)
+    dim = build_fb_canvas(state, 1280, 720, phase=0.5)
+    assert bright != dim
+
+    # Locate the WIN + K band at full brightness: pixels equal to _FB_DEVICE_COLOR.
+    white_offsets = {i for i in range(0, len(bright), 4) if bright[i : i + 4] == _FB_DEVICE_COLOR}
+    assert white_offsets
+
+    dim_offset = _scale_color(_FB_DEVICE_COLOR, 0.30)
+    for i in white_offsets:
+        # Only WIN + K pixels dim; device-name pixels (also white) stay bright.
+        if bright[i : i + 4] != dim[i : i + 4]:
+            assert dim[i : i + 4] == dim_offset
+
+    diff_offsets = {i for i in range(0, len(bright), 4) if bright[i : i + 4] != dim[i : i + 4]}
+    assert diff_offsets
+    assert diff_offsets <= white_offsets
+
+    # Corner background pixels unchanged in both renders.
+    for x, y in ((0, 0), (1279, 719)):
+        assert _pixel_at(bright, 1280, x, y) == _FB_BG_PIXEL
+        assert _pixel_at(dim, 1280, x, y) == _FB_BG_PIXEL
+
+
+def test_build_fb_canvas_stars_mid_life() -> None:
+    """A deterministic seeded star changes bg pixels to the expected scaled tint."""
+    width, height = 640, 480
+    field = StarField(width, height, random.Random(7), max_stars=4)
+    star = Star(x=123, y=45, size_px=1, age_s=0.5, lifetime_s=2.0, peak=0.4, born=0.0)
+    field.stars.append(star)
+
+    canvas = bytearray(_fb_background(width, height))
+    field.draw(canvas, width, height, now_s=0.5)
+
+    brightness = 0.4 * math.sin(math.pi * 0.5 / 2.0)
+    expected = _scale_color(_FB_STAR_COLOR, brightness)
+    off = (45 * width + 123) * 4
+    assert bytes(canvas[off : off + 4]) == expected
+
+
+def test_build_fb_canvas_stars_bounds() -> None:
+    """A star at x=width-1 with size_px=2 must not write past the canvas."""
+    width, height = 640, 480
+    field = StarField(width, height, random.Random(3), max_stars=2)
+    field.stars.append(
+        Star(x=width - 1, y=height - 1, size_px=2, age_s=1.0, lifetime_s=2.0, peak=0.45, born=0.0)
+    )
+
+    canvas = bytearray(_fb_background(width, height))
+    field.draw(canvas, width, height, now_s=1.0)
+    assert len(canvas) == width * height * 4
+    assert _pixel_at(canvas, width, width - 1, height - 1) != _FB_BG_PIXEL
+
+
+def test_starfield_tick_spawns_expiry_and_birth_dimness() -> None:
+    """tick() drops expired stars, spawns up to max_stars, born stars render invisible."""
+    rng = random.Random(1234)
+    field = StarField(640, 480, rng, max_stars=3, spawn_per_tick=2)
+    # Each tick spawns up to `spawn_per_tick`, so two ticks fill the cap.
+    field.tick(0.0)
+    assert len(field.stars) == 2
+    field.tick(0.0)
+    assert len(field.stars) == 3
+    for star in field.stars:
+        assert 0 <= star.x < 640
+        assert 0 <= star.y < 480
+        assert star.size_px in (1, 2)
+        assert 1.5 <= star.lifetime_s <= 3.0
+        assert 0.2 <= star.peak <= 0.45
+        assert star.born == 0.0
+
+    # A brightness-zero draw at exactly born == now leaves the background untouched.
+    bg = bytearray(_fb_background(640, 480))
+    field.draw(bg, 640, 480, now_s=0.0)
+    assert bg == bytearray(_fb_background(640, 480))
+
+    # Let everything expire; only spawn_per_tick new stars should appear.
+    field.tick(10.0)
+    assert len(field.stars) == 2
+    assert all(star.born == 10.0 for star in field.stars)
+
+    # A deterministic mid-life star survives the tick and fades smoothly.
+    field.stars.clear()
+    field.stars.append(Star(x=10, y=10, size_px=1, age_s=0.0, lifetime_s=2.0, peak=0.4, born=9.0))
+    field.tick(10.0)
+    assert len(field.stars) == 3
+    assert field.stars[0].x == 10
+    assert field.stars[0].age_s == 1.0
+
+    canvas = bytearray(_fb_background(640, 480))
+    field.draw(canvas, 640, 480, now_s=10.0)
+    assert _pixel_at(canvas, 640, 10, 10) == _scale_color(_FB_STAR_COLOR, 0.4)
+
+
+def test_starfield_default_max_stars_caps() -> None:
+    assert StarField(640, 480, random.Random(5)).max_stars == 6
+    assert StarField(1920, 1080, random.Random(5)).max_stars == max(6, (1920 * 1080) // 90_000)
+
+
+def test_build_fb_canvas_defaults_static(tmp_path: Path) -> None:
+    """Defaults (phase=0, no stars) render byte-identical to the pre-animation layout."""
+    state = _splash_canvas_state()
+    c1 = build_fb_canvas(state, 1920, 1080)
+    c2 = build_fb_canvas(state, 1920, 1080, phase=0.0, starfield=None)
+    assert c1 == c2
 
 
 def test_cmdline_kms_hotplug_toggle() -> None:

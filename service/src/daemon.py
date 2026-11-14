@@ -6,13 +6,14 @@ import asyncio
 import contextlib
 import logging
 import signal
+import threading
 from dataclasses import dataclass, field
 
 from .config import PicastConfig, PinMode, TransportMode
 from .mice_service import MiceService
 from .platform import HostCapabilities, probe_host_capabilities
 from .rtsp_session import handle_rtsp_connection
-from .splash import PinManager, SplashState, render_splash
+from .splash import PinManager, SplashState, render_splash, run_splash_animation
 from .wifi_p2p import P2P_GATEWAY_IP, WifiP2pManager
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,9 @@ class PicastDaemon:
     _mice: MiceService | None = field(default=None, init=False)
     _rtsp_server: asyncio.AbstractServer | None = field(default=None, init=False)
     _p2p_dial_task: asyncio.Task[None] | None = field(default=None, init=False)
+    _splash_anim_stop: threading.Event | None = field(default=None, init=False)
+    _splash_anim_thread: threading.Thread | None = field(default=None, init=False)
+    _splash_status: str = field(default="STARTING", init=False)
 
     def __post_init__(self) -> None:
         self._pin_manager = PinManager(self.cfg.pin_mode, self.cfg.fixed_pin)
@@ -57,16 +61,60 @@ class PicastDaemon:
             ip_hint=ip_hint,
         )
 
+    def _start_splash_animation(self) -> None:
+        """Start a daemon thread running the game-attract loop (pulsing shortcut + twinkling stars).
+
+        Only one loop runs at a time. Failures are logged at warning level so the
+        daemon can continue without raising; without a usable `/dev/fb0` the
+        animation never starts (TTY fallback stays static).
+        """
+        if self._splash_anim_thread is not None and self._splash_anim_thread.is_alive():
+            return
+        self._splash_anim_stop = threading.Event()
+        self._splash_anim_thread = threading.Thread(
+            target=run_splash_animation,
+            args=(lambda: self._splash_state(self._splash_status), self._splash_anim_stop),
+            daemon=True,
+            name="picast-splash-anim",
+        )
+        try:
+            self._splash_anim_thread.start()
+        except Exception as exc:
+            logger.warning("Failed to start splash animation thread: %s", exc)
+            self._splash_anim_stop = None
+
+    def _stop_splash_animation(self) -> None:
+        """Stop the animation thread gracefully and clean up the bookkeeping fields.
+
+        Swallows `RuntimeError` if the thread never actually started.
+        """
+        if self._splash_anim_stop is not None:
+            self._splash_anim_stop.set()
+            if self._splash_anim_thread is not None:
+                with contextlib.suppress(RuntimeError):
+                    self._splash_anim_thread.join(timeout=1.0)
+        self._splash_anim_stop = None
+        self._splash_anim_thread = None
+
     def _refresh_splash(self, status: str, ip_hint: str = "") -> None:
+        self._splash_status = status
+        if self._splash_anim_thread is not None and self._splash_anim_thread.is_alive():
+            # Animator is running; it repaints next tick with the latest status.
+            return
         render_splash(self._splash_state(status, ip_hint))
 
     async def _refresh_splash_async(self, status: str, ip_hint: str = "") -> None:
         # The framebuffer path writes ~8.3 MB to /dev/fb0; keep it off the
         # asyncio event loop so RTSP keepalives are never stalled by redraws.
+        self._splash_status = status
+        if self._splash_anim_thread is not None and self._splash_anim_thread.is_alive():
+            # Animator is running; it repaints next tick with the latest status.
+            return
         await asyncio.to_thread(render_splash, self._splash_state(status, ip_hint))
 
     async def on_session_started(self, peer_ip: str) -> None:
         """Pause background discovery scans and update splash during an active cast."""
+        self._stop_splash_animation()
         if self._p2p is not None:
             await self._p2p.set_scan_suppression_async(True)
         await self._refresh_splash_async(f"CASTING FROM {peer_ip}", ip_hint=f"PEER {peer_ip}")
@@ -79,7 +127,8 @@ class PicastDaemon:
             if new_pin and self.cfg.pin_mode is PinMode.PER_SESSION:
                 await self._p2p.arm_wps_async()
             await self._p2p.set_scan_suppression_async(False)
-        await self._refresh_splash_async("READY FOR WIN+K CONNECTION")
+        await self._refresh_splash_async("READY")
+        self._start_splash_animation()
 
     async def _on_p2p_peer_connected(self, peer_ip: str, rtsp_port: int) -> None:
         """Spawn outbound RTSP dialer when a Wi-Fi Direct source associates to our GO.
@@ -170,7 +219,8 @@ class PicastDaemon:
             self.cfg.transport_mode.value,
         )
         self._pin_manager.initialize()
-        await self._refresh_splash_async("STARTING WIRELESS DISPLAY")
+        await self._refresh_splash_async("STARTING")
+        self._start_splash_animation()
 
         try:
             if self.cfg.transport_mode in (TransportMode.BOTH, TransportMode.P2P):
@@ -192,7 +242,8 @@ class PicastDaemon:
                 port=self.cfg.rtsp_port,
             )
             logger.info("RTSP receiver listening on :%d", self.cfg.rtsp_port)
-            await self._refresh_splash_async("READY FOR WIN+K CONNECTION")
+            await self._refresh_splash_async("READY")
+            self._start_splash_animation()
 
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
@@ -206,6 +257,7 @@ class PicastDaemon:
     async def shutdown(self) -> None:
         """Stop RTSP, MICE, and Wi-Fi Direct subsystems deterministically."""
         logger.info("Shutting down picast daemon")
+        self._stop_splash_animation()
         if self._p2p_dial_task is not None and not self._p2p_dial_task.done():
             self._p2p_dial_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
