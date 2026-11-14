@@ -97,6 +97,15 @@ class PicastDaemon:
             name="picast-p2p-rtsp-dial",
         )
 
+    async def _on_p2p_peer_disconnected(self) -> None:
+        """Abort any active P2P RTSP session immediately when L2 drops (`AP-STA-DISCONNECTED`)."""
+        if self._p2p_dial_task is not None and not self._p2p_dial_task.done():
+            logger.info("P2P peer disconnected at L2; tearing down active RTSP session")
+            self._p2p_dial_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._p2p_dial_task
+        self._p2p_dial_task = None
+
     async def _dial_and_serve_rtsp(
         self,
         peer_ip: str,
@@ -166,7 +175,10 @@ class PicastDaemon:
         try:
             if self.cfg.transport_mode in (TransportMode.BOTH, TransportMode.P2P):
                 self._p2p = WifiP2pManager(self.cfg, self.caps, self._pin_manager)
-                await self._p2p.start(self._on_p2p_peer_connected)
+                await self._p2p.start(
+                    self._on_p2p_peer_connected,
+                    on_peer_disconnected=self._on_p2p_peer_disconnected,
+                )
 
             if self.cfg.transport_mode in (TransportMode.BOTH, TransportMode.MICE):
                 self._mice = MiceService(self.cfg)

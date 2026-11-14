@@ -93,6 +93,9 @@ class WifiP2pManager:
     _on_peer_connected: Callable[[str, int], Awaitable[None]] | None = field(
         default=None, init=False
     )
+    _on_peer_disconnected: Callable[[], Awaitable[None]] | None = field(
+        default=None, init=False
+    )
 
     def _config_methods(self) -> str:
         """WPS config methods by PIN mode, using tokens wpa_supplicant parses.
@@ -256,9 +259,11 @@ class WifiP2pManager:
     async def start(
         self,
         on_peer_connected: Callable[[str, int], Awaitable[None]] | None = None,
+        on_peer_disconnected: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Create P2P Autonomous GO group, arm WPS PIN/PBC, and launch DHCP `dnsmasq`."""
         self._on_peer_connected = on_peer_connected
+        self._on_peer_disconnected = on_peer_disconnected
         if self.cfg.use_own_supplicant:
             supplicant = SupplicantManager(
                 interface=self.cfg.p2p_interface,
@@ -281,6 +286,9 @@ class WifiP2pManager:
             # that window FAILS — leaving the registrar unarmed (Windows then
             # stalls at provisioning). Wait for the socket explicitly.
             await self._wait_for_group_ctrl_socket(group_iface)
+            await asyncio.to_thread(
+                apply_runtime_wifi_tuning, group_iface, self.cfg.wifi_power_save
+            )
             await asyncio.to_thread(self.arm_wps, group_iface)
             await self.start_dhcp(group_iface)
             self._wps_keepalive_task = asyncio.create_task(
@@ -415,6 +423,8 @@ class WifiP2pManager:
                         # A disconnected peer's advertised RTSP port must never
                         # leak into the `_on_peer_connected` of the NEXT peer.
                         peer_rtsp_port = self.cfg.rtsp_port
+                        if self._on_peer_disconnected is not None:
+                            await self._on_peer_disconnected()
                     if msg.startswith("P2P-PROV-DISC-PBC-REQ"):
                         await asyncio.to_thread(self._run_wpa, "wps_pbc", iface=group_iface)
                     else:
