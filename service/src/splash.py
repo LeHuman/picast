@@ -181,6 +181,25 @@ def format_ansi_splash(state: SplashState) -> str:
     return "\n".join(lines) + "\n"
 
 
+_FB_BG_CACHE: dict[tuple[int, int], bytes] = {}
+
+
+def _fb_background(width: int, height: int) -> bytes:
+    """Immutable full-screen background buffer, cached per resolution.
+
+    Building `bg_pixel * (width * height)` on every redraw costs megabytes of
+    allocation for an identical result; cache the template once per (w, h) and
+    copy it into a fresh mutable `bytearray` per redraw.
+    """
+    key = (width, height)
+    bg = _FB_BG_CACHE.get(key)
+    if bg is None:
+        bg_pixel = b"\x1e\x14\x0f\xff"
+        bg = bg_pixel * (width * height)
+        _FB_BG_CACHE[key] = bg
+    return bg
+
+
 def _write_fb0_splash(state: SplashState, fb_path: Path = Path("/dev/fb0")) -> bool:
     """Attempt pixel-exact 32-bpp BGRA color-block rendering directly to `/dev/fb0`."""
     sysfs_size = Path("/sys/class/graphics/fb0/virtual_size")
@@ -199,9 +218,7 @@ def _write_fb0_splash(state: SplashState, fb_path: Path = Path("/dev/fb0")) -> b
         return False
 
     stride = width * 4
-    bg_pixel = b"\x1e\x14\x0f\xff"
-    row_bg = bg_pixel * width
-    canvas = bytearray(row_bg * height)
+    canvas = bytearray(_fb_background(width, height))
 
     def draw_block_text(text: str, y0: int, scale: int, color_bgra: bytes) -> None:
         cleaned = "".join(ch if ch in _FONT_5X7 else " " for ch in text.upper())

@@ -189,7 +189,7 @@ class PicastConfig:
     jitter_ms: int = 45
     sync_mode: SyncMode = SyncMode.LOW_LATENCY
     audio_enabled: bool = True
-    audio_codec: str = "lpcm"
+    audio_codec: str = "aac"
     audio_sink: AudioSinkMode = AudioSinkMode.AUTO
     tcp_nodelay: bool = True
     idr_on_loss: bool = True

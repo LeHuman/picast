@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import re
 import shutil
-import socket
 import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -23,6 +21,7 @@ from .platform import (
 )
 from .splash import PinManager
 from .supplicant_manager import CTRL_DIR, SupplicantManager
+from .wpa_ctrl import WpaCtrlMonitor, wpa_request
 
 logger = logging.getLogger(__name__)
 P2P_GATEWAY_IP = "192.168.173.1"
@@ -123,34 +122,13 @@ class WifiP2pManager:
         return self.cfg.p2p_interface
 
     def _run_wpa(self, *args: str, iface: str | None = None) -> str:
-        wpa_cli = shutil.which("wpa_cli")
-        if not wpa_cli:
-            return ""
+        """One wpa_supplicant command: direct `wpa_ctrl` datagram, `wpa_cli` fallback."""
         target_iface = iface or self._p2p_dev_iface()
-        cmd = [wpa_cli]
-        if self._ctrl_dir:
-            cmd.extend(["-p", self._ctrl_dir])
-        cmd.extend(["-i", target_iface, *args])
-        try:
-            proc = subprocess.run(
-                cmd,
-                check=False,
-                timeout=5.0,
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode != 0:
-                logger.debug(
-                    "wpa_cli -i %s %s exited %d: %s",
-                    target_iface,
-                    " ".join(args),
-                    proc.returncode,
-                    proc.stderr.strip(),
-                )
-            return proc.stdout.strip()
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("wpa_cli %s timed out/failed on %s: %s", args[0], target_iface, exc)
-            return ""
+        reply = wpa_request(self._ctrl_dir, target_iface, " ".join(args), timeout_s=5.0)
+        if reply is not None:
+            return reply
+        logger.warning("wpa_cli %s unavailable/failed on %s", args[0], target_iface)
+        return ""
 
     def _list_p2p_interfaces(self) -> list[str]:
         iw_bin = shutil.which("iw")
@@ -391,57 +369,33 @@ class WifiP2pManager:
     async def _wps_keepalive_loop(self, group_iface: str) -> None:
         """Keep `Selected Registrar = 1` alive and re-arm immediately on PD/WPS events.
 
-        Uses a direct UNIX datagram `wpa_ctrl` attachment to `/run/picast/wpa/global`
-        (unbuffered kernel datagrams, avoiding `wpa_cli` pipe buffering) plus a
-        60 s periodic refresh well inside hostap's 120 s `WPS_PBC_WALK_TIME`.
+        Uses the async `WpaCtrlMonitor` (`ATTACH`ed UNIX datagram socket on
+        `<ctrl_dir>/global`) plus a 60 s periodic refresh well inside hostap's
+        120 s `WPS_PBC_WALK_TIME`.
         """
-        af_unix = getattr(socket, "AF_UNIX", None)
-        ctrl_dir = Path(self._ctrl_dir) if self._ctrl_dir else None
-        global_sock_path = ctrl_dir / "global" if ctrl_dir else None
-        local_sock_path = ctrl_dir / f"picast-mon-{os.getpid()}" if ctrl_dir else None
-        sock: socket.socket | None = None
-        loop = asyncio.get_running_loop()
+        monitor: WpaCtrlMonitor | None = (
+            WpaCtrlMonitor(self._ctrl_dir) if self._ctrl_dir else None
+        )
+        if monitor is not None and await monitor.attach():
+            logger.info("Attached WPS event monitor to %s/global", self._ctrl_dir)
+        else:
+            monitor = None
         peer_rtsp_port = self.cfg.rtsp_port
 
         try:
-            if (
-                af_unix is not None
-                and global_sock_path is not None
-                and local_sock_path is not None
-                and global_sock_path.exists()
-            ):
-                with contextlib.suppress(OSError):
-                    local_sock_path.unlink(missing_ok=True)
-                s = socket.socket(af_unix, socket.SOCK_DGRAM)
-                s.bind(str(local_sock_path))
-                local_sock_path.chmod(0o600)
-                s.connect(str(global_sock_path))
-                s.setblocking(False)
-                await loop.sock_sendall(s, b"ATTACH")
-                reply = await asyncio.wait_for(loop.sock_recv(s, 64), timeout=2.0)
-                if reply.startswith(b"OK"):
-                    sock = s
-                    logger.info("Attached WPS event monitor to %s", global_sock_path)
-                else:
-                    s.close()
-
             while True:
-                if sock is None:
-                    await asyncio.sleep(_WPS_SEL_REG_REFRESH_S)
+                raw = await (
+                    monitor.recv_event(_WPS_SEL_REG_REFRESH_S)
+                    if monitor is not None
+                    else asyncio.sleep(_WPS_SEL_REG_REFRESH_S, result=None)
+                )
+                if raw is None:
+                    # Refresh timeout (or no monitor socket): periodic re-arm.
                     if not self._paused_for_session:
                         await self.arm_wps_async(group_iface)
                     continue
 
-                try:
-                    raw = await asyncio.wait_for(
-                        loop.sock_recv(sock, 4096), timeout=_WPS_SEL_REG_REFRESH_S
-                    )
-                except TimeoutError:
-                    if not self._paused_for_session:
-                        await self.arm_wps_async(group_iface)
-                    continue
-
-                msg = raw.decode("utf-8", errors="replace").strip()
+                msg = raw
                 # Strip optional `<ifname>` / `<level>` prefix from global ctrl_iface.
                 if msg.startswith("IFNAME="):
                     _, _, msg = msg.partition(" ")
@@ -457,6 +411,10 @@ class WifiP2pManager:
 
                 if any(msg.startswith(ev) for ev in _WPS_REARM_EVENTS):
                     logger.info("P2P/WPS event (%s); refreshing WPS registrar", msg.split()[0])
+                    if msg.startswith("AP-STA-DISCONNECTED"):
+                        # A disconnected peer's advertised RTSP port must never
+                        # leak into the `_on_peer_connected` of the NEXT peer.
+                        peer_rtsp_port = self.cfg.rtsp_port
                     if msg.startswith("P2P-PROV-DISC-PBC-REQ"):
                         await asyncio.to_thread(self._run_wpa, "wps_pbc", iface=group_iface)
                     else:
@@ -472,13 +430,8 @@ class WifiP2pManager:
         except Exception:
             logger.exception("WPS keepalive monitor failed")
         finally:
-            if sock is not None:
-                with contextlib.suppress(OSError):
-                    sock.send(b"DETACH")
-                sock.close()
-            if local_sock_path is not None:
-                with contextlib.suppress(OSError):
-                    local_sock_path.unlink(missing_ok=True)
+            if monitor is not None:
+                await monitor.close()
 
     async def stop(self) -> None:
         """Tear down `dnsmasq`, WPS keepalive, and P2P group cleanly."""

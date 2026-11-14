@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Final, Protocol
 
 from .config import CodecPreference, PicastConfig, SyncMode
-from .edid import build_wfd2_video_formats, build_wfd_video_formats, inspect_display
+from .edid import (
+    DisplayTimingSummary,
+    build_wfd2_video_formats,
+    build_wfd_video_formats,
+    inspect_display,
+)
 from .platform import (
     HostCapabilities,
     resolve_effective_fps,
@@ -204,38 +209,46 @@ def build_wfd_m3_response(
     caps: HostCapabilities,
     rtp_port: int,
     allow_uibc: bool = False,
+    display_info: DisplayTimingSummary | None = None,
 ) -> str:
-    """Build WFA M3 `GET_PARAMETER` response with universal H.264 + optional WFD 2.0 HEVC."""
+    """Build WFA M3 `GET_PARAMETER` response with universal H.264 + optional WFD 2.0 HEVC.
+
+    `requested_body` is parsed into an exact line `set[str]` (never substring
+    matching, so `wfd2_video_formats` cannot falsely satisfy `wfd_video_formats`).
+    `display_info` is optional so a caller can inspect the display once per RTSP
+    connection instead of once per M3 request.
+    """
     effective_fps = resolve_effective_fps(cfg, caps)
     video_formats = build_wfd_video_formats(cfg.max_resolution, effective_fps)
-    display_info = inspect_display()
+    info = display_info if display_info is not None else inspect_display()
+    requested_params = {ln.strip() for ln in requested_body.splitlines() if ln.strip()}
 
     lines: list[str] = []
-    if "wfd_video_formats" in requested_body:
+    if "wfd_video_formats" in requested_params:
         lines.append(f"wfd_video_formats: {video_formats}")
-    if "wfd2_video_formats" in requested_body:
+    if "wfd2_video_formats" in requested_params:
         if resolve_wfd2_hevc_enabled(cfg, caps):
             hevc_flag = cfg.codec is not CodecPreference.H264
             wfd2_fmt = build_wfd2_video_formats(cfg.max_resolution, effective_fps, hevc=hevc_flag)
             lines.append(f"wfd2_video_formats: {wfd2_fmt}")
         else:
             lines.append("wfd2_video_formats: none")
-    if "wfd_audio_codecs" in requested_body:
+    if "wfd_audio_codecs" in requested_params:
         # Primary Sink (0x0011) MUST advertise at least one mandatory WFD audio
         # codec; returning `wfd_audio_codecs: none` makes Windows 10 abort RTSP
         # at M3. Advertise AAC 48kHz 2ch (matching upstream `d2.py` GStreamer
         # mode): when `cfg.audio_enabled` is False, `picast-player --no-audio`
         # leaves the MPEG-TS audio PID unlinked so `alsasink` is never opened.
         lines.append("wfd_audio_codecs: AAC 00000001 00")
-    if "wfd_3d_video_formats" in requested_body:
+    if "wfd_3d_video_formats" in requested_params:
         lines.append("wfd_3d_video_formats: none")
-    if "wfd_content_protection" in requested_body:
+    if "wfd_content_protection" in requested_params:
         lines.append("wfd_content_protection: none")
-    if "wfd_coupled_sink" in requested_body:
+    if "wfd_coupled_sink" in requested_params:
         lines.append("wfd_coupled_sink: none")
-    if "wfd_connector_type" in requested_body:
+    if "wfd_connector_type" in requested_params:
         lines.append("wfd_connector_type: 05")
-    if "wfd_uibc_capability" in requested_body:
+    if "wfd_uibc_capability" in requested_params:
         lines.append(
             "wfd_uibc_capability: input_category_list=GENERIC, HIDC;"
             "generic_cap_list=Keyboard, Mouse;"
@@ -243,31 +256,31 @@ def build_wfd_m3_response(
             if allow_uibc
             else "wfd_uibc_capability: none"
         )
-    if "wfd_client_rtp_ports" in requested_body:
+    if "wfd_client_rtp_ports" in requested_params:
         lines.append(f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {rtp_port} 0 mode=play")
-    if "wfd_display_edid" in requested_body:
+    if "wfd_display_edid" in requested_params:
         edid_magic = b"\x00\xff\xff\xff\xff\xff\xff\x00"
-        if display_info.connected and display_info.edid_bytes[:8] == edid_magic:
-            edid_len_blocks = max(1, len(display_info.edid_bytes) // 128)
-            hex_payload = display_info.edid_bytes[: edid_len_blocks * 128].hex()
+        if info.connected and info.edid_bytes[:8] == edid_magic:
+            edid_len_blocks = max(1, len(info.edid_bytes) // 128)
+            hex_payload = info.edid_bytes[: edid_len_blocks * 128].hex()
             lines.append(f"wfd_display_edid: {edid_len_blocks:04X} {hex_payload}")
         else:
             lines.append("wfd_display_edid: none")
-    if "intel_friendly_name" in requested_body:
+    if "intel_friendly_name" in requested_params:
         lines.append(f"intel_friendly_name: {cfg.device_name}")
-    if "intel_sink_manufacturer_name" in requested_body:
+    if "intel_sink_manufacturer_name" in requested_params:
         lines.append("intel_sink_manufacturer_name: picast")
-    if "intel_sink_model_name" in requested_body:
+    if "intel_sink_model_name" in requested_params:
         lines.append("intel_sink_model_name: picast-trixie")
-    if "intel_sink_version" in requested_body:
+    if "intel_sink_version" in requested_params:
         lines.append("intel_sink_version: 2.0.0")
-    if "intel_sink_device_URL" in requested_body:
+    if "intel_sink_device_URL" in requested_params:
         lines.append("intel_sink_device_URL: none")
-    if "wfd_idr_request_capability" in requested_body:
+    if "wfd_idr_request_capability" in requested_params:
         lines.append("wfd_idr_request_capability: 1")
-    if "wfd_I2C" in requested_body:
+    if "wfd_I2C" in requested_params:
         lines.append("wfd_I2C: none")
-    if "wfd_standby_resume_capability" in requested_body:
+    if "wfd_standby_resume_capability" in requested_params:
         lines.append("wfd_standby_resume_capability: none")
 
     return "\r\n".join(lines) + ("\r\n" if lines else "")
@@ -317,6 +330,9 @@ async def handle_rtsp_connection(
         if events:
             await events.on_session_started(peer_ip)
 
+        # Inspect once per connection: M3 may arrive several times, and the DRM
+        # sysfs EDID read does not change mid-negotiation.
+        display_info = inspect_display()
         framer = RtspStreamFramer()
         runner = PlayerProcessRunner()
         negotiated_codec = "h264"
@@ -382,20 +398,25 @@ async def handle_rtsp_connection(
                 logger.debug("IDR forwarder stopped on socket close: %s", exc)
 
         idr_task = asyncio.create_task(idr_forwarder())
+        # One persistent task per connection instead of a fresh `asyncio.Task`
+        # per incoming chunk (read_task still rotates; exit_task must not, so
+        # `player_exited.wait()` stays observable across loop iterations).
+        exit_task: asyncio.Task[bool] | None = None
 
         try:
             while not player_exited.is_set():
                 read_task = asyncio.create_task(reader.read(4096))
-                exit_task = asyncio.create_task(player_exited.wait())
+                if exit_task is None:
+                    exit_task = asyncio.create_task(player_exited.wait())
                 done, pending = await asyncio.wait(
                     {read_task, exit_task},
                     timeout=65.0,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                for p in pending:
-                    p.cancel()
+                if read_task in pending:
+                    read_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
-                        await p
+                        await read_task
 
                 if not done:
                     logger.info("RTSP session from %s timed out waiting for keepalive", peer_ip)
@@ -436,7 +457,7 @@ async def handle_rtsp_connection(
                             params = [ln.strip() for ln in body_part.splitlines() if ln.strip()]
                             logger.info("RTSP M3 req params: %s", ", ".join(params))
                         resp_body = build_wfd_m3_response(
-                            body_part, cfg, caps, negotiated_rtp_port
+                            body_part, cfg, caps, negotiated_rtp_port, display_info=display_info
                         )
                         writer.write(format_rtsp_response(cseq, body=resp_body))
                     elif text.startswith("SET_PARAMETER"):
@@ -451,7 +472,6 @@ async def handle_rtsp_connection(
                         if "client_port=" in text:
                             negotiated_rtp_port = parse_client_rtp_port(text, cfg.rtp_port)
                         writer.write(format_rtsp_response(cseq))
-                        await writer.drain()
                         if "wfd_trigger_method: SETUP" in text:
                             if rtcp_transport is None:
                                 with contextlib.suppress(OSError):
@@ -504,6 +524,10 @@ async def handle_rtsp_connection(
                     bg_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await bg_task
+            if exit_task is not None and not exit_task.done():
+                exit_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await exit_task
             if rtcp_transport is not None:
                 rtcp_transport.close()
             if idr_transport is not None:

@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .wpa_ctrl import wpa_request
+
 logger = logging.getLogger(__name__)
 CTRL_DIR = "/run/picast/wpa"
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -57,6 +59,66 @@ _NM_CONN_DIRS = (
     "/etc/NetworkManager/system-connections/",
     "/run/NetworkManager/system-connections/",
 )
+# NetworkManager keyfile group names (current + deprecated aliases).
+_SSID_GROUPS = ("wifi", "802-11-wireless")
+_PSK_GROUPS = ("802-11-wireless-security", "wifi-security")
+_REGDOM_PATH = Path("/sys/module/cfg80211/parameters/ieee80211_regdom")
+
+
+def parse_nm_keyfile(text: str) -> dict[str, dict[str, str]]:
+    """Parse an NM keyfile into `{group: {key: value}}` without subprocesses.
+
+    A clean line parser instead of `configparser`: SSIDs/PSKs may contain
+    characters (`#`, `%`, duplicate keys) that make INI parsers misbehave.
+    """
+    sections: dict[str, dict[str, str]] = {}
+    current: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = sections.setdefault(stripped[1:-1].strip(), {})
+            continue
+        name, sep, value = stripped.partition("=")
+        if sep:
+            current[name.strip()] = value.strip().strip('"').strip("'")
+    return sections
+
+
+def scan_nm_keyfiles(
+    conn_dirs: tuple[str, ...] | list[str],
+    groups: tuple[str, ...],
+    key: str,
+) -> str | None:
+    """First non-empty `key=` in `groups` across `*.nmconnection` files in `conn_dirs`."""
+    for conn_dir in conn_dirs:
+        directory = Path(conn_dir)
+        if not directory.is_dir():
+            continue
+        try:
+            paths = sorted(directory.glob("*.nmconnection"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for group in groups:
+                value = parse_nm_keyfile(text).get(group, {}).get(key, "")
+                if value:
+                    return value
+    return None
+
+
+def read_host_regdom(path: Path = _REGDOM_PATH) -> str:
+    """Read the cfg80211 regulatory domain; `US` for world (`00`) or missing."""
+    try:
+        value = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return "US"
+    return value if len(value) == 2 and value.isalpha() and value.isupper() else "US"
 
 
 def read_active_ssid(interface: str) -> str | None:
@@ -76,22 +138,7 @@ def read_active_ssid(interface: str) -> str | None:
             res = None
         if res is not None and res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
-    for conn_dir in _NM_CONN_DIRS:
-        if not Path(conn_dir).exists():
-            continue
-        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-            grep = subprocess.run(
-                ["grep", "-rh", "^ssid=", conn_dir],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-            )
-            for line in grep.stdout.splitlines():
-                value = line.split("=", 1)[1].strip().strip('"')
-                if value:
-                    return value
-    return None
+    return scan_nm_keyfiles(_NM_CONN_DIRS, _SSID_GROUPS, "ssid")
 
 
 def read_active_psk(interface: str) -> str | None:
@@ -114,22 +161,7 @@ def read_active_psk(interface: str) -> str | None:
             res = None
         if res is not None and res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
-    for conn_dir in _NM_CONN_DIRS:
-        if not Path(conn_dir).exists():
-            continue
-        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-            grep = subprocess.run(
-                ["grep", "-rh", "^psk=", conn_dir],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-            )
-            for line in grep.stdout.splitlines():
-                value = line.split("=", 1)[1].strip().strip('"')
-                if value:
-                    return value
-    return None
+    return scan_nm_keyfiles(_NM_CONN_DIRS, _PSK_GROUPS, "psk")
 
 
 def build_supplicant_config(
@@ -137,6 +169,7 @@ def build_supplicant_config(
     psk: str | None,
     device_name: str,
     config_methods: str = "virtual_display keypad",
+    country: str = "US",
 ) -> str:
     """Build a complete wpa_supplicant config: station network + P2P/WFD identity.
 
@@ -144,6 +177,8 @@ def build_supplicant_config(
     type). `config_methods` is chosen by PIN mode (`push_button` for zero-PIN,
     display/keypad otherwise). PSKs that are 64 hex chars are written unquoted (the
     precomputed PBKDF2 hash form); passphrases are backslash/quote-escaped.
+    `country` should come from `read_host_regdom()` so the autonomous GO follows
+    the live cfg80211 regulatory domain instead of hardcoding `US`.
     """
     if psk:
         if _HEX64_RE.fullmatch(psk):
@@ -156,7 +191,7 @@ def build_supplicant_config(
         network = f'\tnetwork={{\n\t\tssid="{ssid}"\n\t\tkey_mgmt=NONE\n\t}}\n'
     return (
         "ctrl_interface=DIR=/run/picast/wpa GROUP=netdev\n"
-        "country=US\n"
+        f"country={country}\n"
         f"device_name={device_name}\n"
         "device_type=7-0050F204-1\n"
         f"config_methods={config_methods}\n"
@@ -223,36 +258,12 @@ class SupplicantManager:
     _lease_gw: str | None = field(default=None, init=False)
 
     def _ping(self) -> bool:
-        cli = shutil.which("wpa_cli")
-        if not cli:
-            return False
-        try:
-            res = subprocess.run(
-                [cli, "-p", CTRL_DIR, "-i", self.interface, "ping"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return "PONG" in res.stdout
+        reply = wpa_request(CTRL_DIR, self.interface, "PING", timeout_s=3.0)
+        return reply is not None and "PONG" in reply
 
     def _is_associated(self) -> bool:
-        cli = shutil.which("wpa_cli")
-        if not cli:
-            return False
-        try:
-            res = subprocess.run(
-                [cli, "-p", CTRL_DIR, "-i", self.interface, "status"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return "wpa_state=COMPLETED" in res.stdout
+        status = wpa_request(CTRL_DIR, self.interface, "status", timeout_s=3.0)
+        return status is not None and "wpa_state=COMPLETED" in status
 
     def _stop_system_network_stack(self) -> None:
         """Stop NM and the *system* wpa_supplicant (NM stop leaves it running,
@@ -362,7 +373,9 @@ class SupplicantManager:
                     )
                 PID_PATH.unlink(missing_ok=True)
         CONF_PATH.write_text(
-            build_supplicant_config(ssid, psk, self.device_name, self.config_methods),
+            build_supplicant_config(
+                ssid, psk, self.device_name, self.config_methods, country=read_host_regdom()
+            ),
             "utf-8",
         )
         CONF_PATH.chmod(0o600)
