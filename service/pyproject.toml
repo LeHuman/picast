@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "picast"
+version = "2.0.0"
+description = "Typed Python 3.13+ control plane, Wi-Fi Direct/MICE orchestrator, splash renderer, and CLI for picast on Raspberry Pi OS Trixie"
+readme = "../README.md"
+requires-python = ">=3.13"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "picast contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11",
+  "pytest>=8.3",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+picast = "picast.cli:main"
+
+[tool.setuptools]
+packages = ["picast"]
+
+[tool.setuptools.package-dir]
+picast = "src"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["."]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src", "test"]
+explicit_package_bases = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["."]
+addopts = "-q"
