@@ -216,6 +216,9 @@ class PicastConfig:
         if len(pin_digits) != 8:
             pin_digits = "12345670"
 
+        dec = self.decoder.strip().lower()
+        normalized_decoder = dec if dec in {"auto", "v4l2", "sw"} else "auto"
+
         return PicastConfig(
             device_name=self.device_name.strip()[:32] or "picast",
             transport_mode=self.transport_mode,
@@ -231,7 +234,7 @@ class PicastConfig:
             max_resolution=self.max_resolution.strip() or "1920x1080",
             max_fps=self.max_fps.strip() or "auto",
             codec=self.codec,
-            decoder=self.decoder.strip() or "auto",
+            decoder=normalized_decoder,
             jitter_ms=max(10, min(500, int(self.jitter_ms))),
             sync_mode=self.sync_mode,
             audio_enabled=bool(self.audio_enabled),

@@ -95,13 +95,6 @@ class PicastDaemon:
         self._splash_anim_stop = None
         self._splash_anim_thread = None
 
-    def _refresh_splash(self, status: str) -> None:
-        self._splash_status = status
-        if self._splash_anim_thread is not None and self._splash_anim_thread.is_alive():
-            # Animator is running; it repaints next tick with the latest status.
-            return
-        render_splash(self._splash_state(status))
-
     async def _refresh_splash_async(self, status: str) -> None:
         self._splash_status = status
         if self._splash_anim_thread is not None and self._splash_anim_thread.is_alive():

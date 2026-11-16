@@ -14,8 +14,12 @@ if [ -r "$PID_FILE" ]; then
     fi
     rm -f "$PID_FILE"
 fi
-pkill -x wpa_supplicant -f '/run/picast/wpa/picast-wpa\.conf' 2>/dev/null && sleep 1 || true
-pkill -9 -x wpa_supplicant -f '/run/picast/wpa/picast-wpa\.conf' 2>/dev/null || true
+for pid in $(pgrep -x wpa_supplicant 2>/dev/null || true); do
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF '/run/picast/wpa/picast-wpa.conf'; then
+        kill "$pid" 2>/dev/null && sleep 1 || true
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+done
 for unit in wpa_supplicant NetworkManager; do
     systemctl is-active --quiet "$unit" ||
         systemctl --no-block --no-ask-password start "$unit"

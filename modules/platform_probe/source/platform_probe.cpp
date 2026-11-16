@@ -315,16 +315,6 @@ HardwareCapabilities probe_hardware() {
         }
         if (!chosen.empty()) {
             caps.drm_connector = chosen.filename().string();
-            const std::string cid_str = read_text_file(chosen / "connector_id");
-            if (!cid_str.empty()) {
-                try {
-                    const unsigned long parsed_id = std::stoul(cid_str);
-                    if (parsed_id > 0UL) {
-                        caps.drm_connector_id = static_cast<std::uint32_t>(parsed_id);
-                    }
-                } catch (...) {
-                }
-            }
         }
     }
 

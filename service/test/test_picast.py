@@ -218,8 +218,10 @@ def test_wfd_m3_response_includes_h264_and_conditional_wfd2(tmp_path: Path) -> N
     assert "wfd_audio_codecs: LPCM 00000003 00" in resp_30
 
     assert is_wfd2_hevc_selected("wfd2_video_formats: 08 00 02 01 0001FFFF 00 00 00\r\n")
+    assert is_wfd2_hevc_selected("wfd2_video_formats: 40 01 04 0080 000001ffbdeb\r\n")
     assert not is_wfd2_hevc_selected("wfd2_video_formats: none\r\n")
     assert not is_wfd2_hevc_selected("wfd2_video_formats: 08 00 02 02 0001FFFF 00 00 00\r\n")
+    assert not is_wfd2_hevc_selected("wfd2_video_formats: 01 01 01 0080 000001ffbdeb\r\n")
 
 
 def test_mice_source_ready_and_p2p_helpers(tmp_path: Path) -> None:
@@ -747,6 +749,9 @@ def test_audio_codec_default_and_validation() -> None:
     assert PicastConfig(audio_codec="AAC").validated().audio_codec == "aac"
     # Unknown values keep failing closed to LPCM (valid legacy default).
     assert PicastConfig(audio_codec="opus").validated().audio_codec == "lpcm"
+    # Decoder normalizes unknown values to "auto" so picast-player CLI never fails.
+    assert PicastConfig(decoder="V4L2").validated().decoder == "v4l2"
+    assert PicastConfig(decoder="omx").validated().decoder == "auto"
 
 
 def test_uibc_enabled_config_roundtrip(tmp_path: Path) -> None:

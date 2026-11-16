@@ -69,38 +69,33 @@ void test_inactive_pipeline_lifecycle() {
     EXPECT_TRUE(!pipe.is_running());
 }
 
-void test_latency_defaults_queue_bounds_and_connector_id() {
+void test_latency_defaults_and_queue_bounds() {
     picast::HardwareCapabilities caps;
     caps.board = picast::PiBoardModel::PiZero2W;
     caps.has_v4l2_h264_m2m = true;
     caps.drm_connector = "card0-HDMI-A-1";
-    caps.drm_connector_id = 32U;
 
     picast::PipelineConfig cfg;
-    // Default struct latency (45 ms); the app sets ts_demux_latency_ms to 0 by default.
+    // `RtpJitterBuffer` already reorders RTP upstream, so `tsdemux` defaults to 0 ms.
     const auto appsrc_pipe = picast::build_gstreamer_pipeline_description(cfg, caps);
     EXPECT_TRUE(appsrc_pipe.find("appsrc name=ts_src") != std::string::npos);
     EXPECT_TRUE(appsrc_pipe.find("leaky-type=downstream") != std::string::npos);
-    EXPECT_TRUE(appsrc_pipe.find("tsdemux name=demux latency=45") != std::string::npos);
+    EXPECT_TRUE(appsrc_pipe.find("tsdemux name=demux latency=0") != std::string::npos);
     // Pre-decode compressed-frame queue must be bounded (no 200-buffer / 1 s defaults).
     EXPECT_TRUE(appsrc_pipe.find("queue max-size-buffers=12 max-size-bytes=0 max-size-time=0")
                 != std::string::npos);
     // Post-decode queue stays leaky with the 2-buffer bound before kmssink.
     EXPECT_TRUE(appsrc_pipe.find("queue leaky=downstream max-size-buffers=2 ! kmssink")
                 != std::string::npos);
+    EXPECT_TRUE(appsrc_pipe.find("can-scale") == std::string::npos);
 
-    cfg.ts_demux_latency_ms = 0U;
-    const auto zero_latency = picast::build_gstreamer_pipeline_description(cfg, caps);
-    EXPECT_TRUE(zero_latency.find("tsdemux name=demux latency=0") != std::string::npos);
-
-    // Explicit drm_connector matching probed connector propagates connector-id=<n>.
-    cfg.drm_connector = "HDMI-A-1";
-    const auto pinned_conn = picast::build_gstreamer_pipeline_description(cfg, caps);
-    EXPECT_TRUE(pinned_conn.find("connector-id=32") != std::string::npos);
-    EXPECT_TRUE(pinned_conn.find("can-scale") == std::string::npos);
+    // Explicit ts_demux_latency_ms override propagates to tsdemux.
+    cfg.ts_demux_latency_ms = 45U;
+    const auto custom_latency = picast::build_gstreamer_pipeline_description(cfg, caps);
+    EXPECT_TRUE(custom_latency.find("tsdemux name=demux latency=45") != std::string::npos);
 
     // Default / HDMI ALSA sinks must bypass PipeWire's user-scoped `default` PCM.
-    EXPECT_TRUE(pinned_conn.find("alsasink device=sysdefault") != std::string::npos);
+    EXPECT_TRUE(custom_latency.find("alsasink device=sysdefault") != std::string::npos);
     cfg.audio_sink = picast::AudioSinkKind::Hdmi;
     const auto hdmi_audio = picast::build_gstreamer_pipeline_description(cfg, caps);
     EXPECT_TRUE(hdmi_audio.find("alsasink device=sysdefault") != std::string::npos);
@@ -111,7 +106,7 @@ void test_latency_defaults_queue_bounds_and_connector_id() {
 int main() {
     test_decoder_and_pipeline_selection();
     test_inactive_pipeline_lifecycle();
-    test_latency_defaults_queue_bounds_and_connector_id();
+    test_latency_defaults_and_queue_bounds();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " assertion(s) failed.\n";

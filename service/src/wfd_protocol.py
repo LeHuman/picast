@@ -138,11 +138,12 @@ def is_wfd2_hevc_selected(message_text: str) -> bool:
     if not val or val.lower() == "none":
         return False
     tokens = val.split()
-    # WFD 2.0: token[2] is codec-type (`02`) and token[3] is profile (`01`=HEVC Main,
-    # `02`=H.264 CHP). Reject `02 02` so H.264 sent under WFD2 never launches an HEVC decoder.
-    if len(tokens) >= 4 and tokens[2] == "02" and tokens[3] == "02":
-        return False
-    return True
+    # Reject H.264 (`01` in WFD 2.0 spec and `02 02` in picast's M3 descriptor)
+    # so H.264 sent under `wfd2_video_formats:` never launches an HEVC decoder.
+    return not (
+        len(tokens) >= 4
+        and (tokens[2] == "01" or (tokens[2] == "02" and tokens[3] == "02"))
+    )
 
 
 def build_wfd_m3_response(

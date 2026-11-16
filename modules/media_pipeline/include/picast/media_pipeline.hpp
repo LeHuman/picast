@@ -23,22 +23,14 @@ enum class VideoCodec {
     H265,
 };
 
-/** @brief Negotiated Miracast audio payload codec. */
-enum class AudioCodec {
-    Lpcm,
-    Aac,
-};
-
 /** @brief Pipeline runtime tuning options derived from CLI flags and `picast.conf`. */
 struct PipelineConfig {
     VideoCodec video_codec{VideoCodec::H264};
-    AudioCodec audio_codec{AudioCodec::Lpcm};
     DecoderBackend decoder_preference{DecoderBackend::Auto};
     AudioSinkKind audio_sink{AudioSinkKind::Auto};
     bool low_latency_sync{true};
     bool enable_audio{true};
-    std::uint16_t ts_demux_latency_ms{45U};
-    std::string drm_connector{};
+    std::uint16_t ts_demux_latency_ms{0U};
 };
 
 /**
@@ -47,13 +39,6 @@ struct PipelineConfig {
  * @return `"h264"` or `"h265"`.
  */
 [[nodiscard]] std::string_view to_string(VideoCodec codec) noexcept;
-
-/**
- * @brief Convert audio codec enum to lowercase identifier.
- * @param codec Audio codec enum.
- * @return `"lpcm"` or `"aac"`.
- */
-[[nodiscard]] std::string_view to_string(AudioCodec codec) noexcept;
 
 /**
  * @brief Resolve the concrete GStreamer video decoder element for the active board and codec.

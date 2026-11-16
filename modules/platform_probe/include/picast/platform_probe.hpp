@@ -56,7 +56,6 @@ struct HardwareCapabilities {
     std::string v4l2_h264_device{};
     std::string v4l2_hevc_device{};
     std::string drm_connector{};
-    std::uint32_t drm_connector_id{0U};
     DecoderBackend recommended_h264{DecoderBackend::SoftwareNeonH264};
     std::vector<std::uint8_t> edid{};
 };

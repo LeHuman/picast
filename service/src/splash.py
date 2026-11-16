@@ -355,6 +355,59 @@ def _fb_background(width: int, height: int, bpp: int = 32) -> bytes:
     return bg
 
 
+@dataclass(frozen=True, slots=True)
+class _SplashLayout:
+    """Shared vertical/scale coordinates so renderer and dirty-rect blink never drift."""
+
+    wordmark_scale: int
+    wordmark_y: int
+    rule_y: int
+    rule_width: int
+    rule_thickness: int
+    pin_scale: int
+    pin_y: int
+    device_scale: int
+    winkey_y: int
+    device_y: int
+    status_scale: int
+    status_y: int
+    transport_scale: int
+    transport_y: int
+
+
+def _compute_layout(width: int, height: int) -> _SplashLayout:
+    wordmark_scale = max(2, width // 240)
+    wordmark_y = height // 5
+    rule_y = wordmark_y + 7 * wordmark_scale + height // 30
+    rule_width = (len("PICAST") * 6 - 1) * wordmark_scale
+    rule_thickness = max(2, height // 540)
+    pin_scale = max(4, width // 60)
+    pin_y = max(0, (height - 7 * pin_scale) // 2 - height // 16)
+    device_scale = max(3, width // 160)
+    winkey_y = pin_y + 7 * pin_scale + height // 18
+    device_y = winkey_y + 7 * device_scale + height // 40
+    status_scale = max(2, width // 240)
+    status_y = height - height // 5
+    transport_scale = max(2, width // 300)
+    transport_y = status_y + 7 * status_scale + height // 40
+    return _SplashLayout(
+        wordmark_scale=wordmark_scale,
+        wordmark_y=wordmark_y,
+        rule_y=rule_y,
+        rule_width=rule_width,
+        rule_thickness=rule_thickness,
+        pin_scale=pin_scale,
+        pin_y=pin_y,
+        device_scale=device_scale,
+        winkey_y=winkey_y,
+        device_y=device_y,
+        status_scale=status_scale,
+        status_y=status_y,
+        transport_scale=transport_scale,
+        transport_y=transport_y,
+    )
+
+
 def build_fb_canvas(
     state: SplashState,
     width: int,
@@ -430,43 +483,39 @@ def build_fb_canvas(
             off = py * stride + x0 * bytes_per_px
             canvas[off : off + span * bytes_per_px] = row
 
-    # 1. Dim wordmark in the upper area, never glued to the top edge.
-    wordmark_scale = max(2, width // 240)
-    wordmark_y = height // 5
-    draw_block_text("PICAST", wordmark_y, wordmark_scale, _FB_WORDMARK_COLOR)
+    layout = _compute_layout(width, height)
 
-    # 2. Thin amber accent rule between wordmark and PIN — exactly as wide as
-    # the wordmark ("PICAST": 6 glyphs -> 6*6-1 columns) for optical alignment.
-    rule_y = wordmark_y + 7 * wordmark_scale + height // 30
-    rule_width = (len("PICAST") * 6 - 1) * wordmark_scale
-    draw_rule(rule_y, max(2, height // 540), rule_width, _FB_ACCENT_COLOR)
+    # 1. Dim wordmark in the upper area, never glued to the top edge.
+    draw_block_text("PICAST", layout.wordmark_y, layout.wordmark_scale, _FB_WORDMARK_COLOR)
+
+    # 2. Thin amber accent rule between wordmark and PIN — aligned to wordmark width.
+    draw_rule(layout.rule_y, layout.rule_thickness, layout.rule_width, _FB_ACCENT_COLOR)
 
     # 3. The PIN: dead-center hero, brightest and largest element.
-    pin_scale = max(4, width // 60)
-    pin_y = max(0, (height - 7 * pin_scale) // 2 - height // 16)
-    draw_block_text(_format_pin_text(state.pin_display), pin_y, pin_scale, _FB_PIN_COLOR)
+    draw_block_text(
+        _format_pin_text(state.pin_display), layout.pin_y, layout.pin_scale, _FB_PIN_COLOR
+    )
 
     # 4. The actionable shortcut directly under the hero. The device name is
     # redundant when it matches the wordmark, so it is only drawn when distinct.
-    # Only the WIN + K line pulses with `phase`; nothing else blinks.
-    device_scale = max(3, width // 160)
-    winkey_y = pin_y + 7 * pin_scale + height // 18
+    # Only the WIN + K line blinks with `phase`; nothing else blinks.
     blink = 1.0 if phase % 1.0 < 0.5 else _BLINK_DIM
-    draw_block_text("WIN + K", winkey_y, device_scale, _scale_color(_FB_DEVICE_COLOR, blink))
+    draw_block_text(
+        "WIN + K", layout.winkey_y, layout.device_scale, _scale_color(_FB_DEVICE_COLOR, blink)
+    )
     device_name = state.device_name.strip().upper()[:12]
     if device_name and device_name != "PICAST":
-        device_y = winkey_y + 7 * device_scale + height // 40
-        draw_block_text(device_name, device_y, device_scale, _FB_DEVICE_COLOR)
+        draw_block_text(device_name, layout.device_y, layout.device_scale, _FB_DEVICE_COLOR)
 
     # 5. Bottom stack: status line plus tiny transport footer, lifted from the
     # bottom edge to close the hollow band under the hero cluster.
-    status_scale = max(2, width // 240)
-    status_y = height - height // 5
-    draw_block_text(state.status_line[:32], status_y, status_scale, _FB_STATUS_COLOR)
-
-    transport_scale = max(2, width // 300)
-    transport_y = status_y + 7 * status_scale + height // 40
-    draw_block_text(state.transport_label[:16], transport_y, transport_scale, _FB_TRANSPORT_COLOR)
+    draw_block_text(state.status_line[:32], layout.status_y, layout.status_scale, _FB_STATUS_COLOR)
+    draw_block_text(
+        state.transport_label[:16],
+        layout.transport_y,
+        layout.transport_scale,
+        _FB_TRANSPORT_COLOR,
+    )
 
     return canvas
 
@@ -532,11 +581,9 @@ def _write_fb0_splash(state: SplashState, fb_path: Path = Path("/dev/fb0")) -> b
 
 def _winkey_band_offsets(width: int, height: int, bpp: int) -> tuple[int, int]:
     """Return `(start_byte_offset, end_byte_offset)` covering the blinking `WIN + K` band."""
-    pin_scale = max(4, width // 60)
-    pin_y = max(0, (height - 7 * pin_scale) // 2 - height // 16)
-    device_scale = max(3, width // 160)
-    winkey_y = max(0, pin_y + 7 * pin_scale + height // 18)
-    end_y = min(height, winkey_y + 7 * device_scale)
+    layout = _compute_layout(width, height)
+    winkey_y = max(0, layout.winkey_y)
+    end_y = min(height, winkey_y + 7 * layout.device_scale)
     stride = width * (bpp // 8)
     return winkey_y * stride, max(winkey_y, end_y) * stride
 

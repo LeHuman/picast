@@ -30,6 +30,7 @@ _P2P_IFACE_RE = re.compile(r"Interface\s+(p2p-[^\s]+)")
 _FREQ_RE = re.compile(r"^freq=(\d+)$", re.MULTILINE)
 _WFD_DEV_INFO_RE = re.compile(r"wfd_dev_info=0x([0-9a-fA-F]{12})")
 _MAC_RE = re.compile(r"\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b")
+_P2P_DEV_ADDR_RE = re.compile(r"\bp2p_dev_addr=([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b")
 _IPV4_RE = re.compile(r"^\d+(?:\.\d+){3}$")
 # `wps_registrar_add_pin()` in hostap registers a hardcoded 120s
 # (`WPS_PBC_WALK_TIME`) `wps_registrar_set_selected_timeout` that clears
@@ -436,15 +437,11 @@ class WifiP2pManager:
     async def _drain_dnsmasq_stderr(proc: asyncio.subprocess.Process) -> None:
         if proc.stderr is None:
             return
-        try:
+        with contextlib.suppress(Exception):
             while line := await proc.stderr.readline():
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
                     logger.debug("dnsmasq: %s", text)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
 
     def set_scan_suppression(self, active_session: bool) -> None:
         """Keep background Wi-Fi scan activity off the single radio while streaming."""
@@ -539,9 +536,13 @@ class WifiP2pManager:
                     logger.info("P2P/WPS event (%s); refreshing WPS registrar", msg.split()[0])
                     if msg.startswith("AP-STA-DISCONNECTED"):
                         mac = parse_peer_mac(msg)
+                        dev_match = _P2P_DEV_ADDR_RE.search(msg)
+                        dev_mac = dev_match.group(1).lower() if dev_match else None
                         if mac:
                             peer_ports.pop(mac, None)
-                        else:
+                        if dev_mac:
+                            peer_ports.pop(dev_mac, None)
+                        if not mac and not dev_mac:
                             peer_ports.clear()
                         await self._cancel_peer_connect_task()
                         if self._on_peer_disconnected is not None:
@@ -555,8 +556,14 @@ class WifiP2pManager:
                 elif msg.startswith("AP-STA-CONNECTED"):
                     logger.info("P2P/WPS milestone: %s", msg)
                     mac = parse_peer_mac(msg)
+                    dev_match = _P2P_DEV_ADDR_RE.search(msg)
+                    dev_mac = dev_match.group(1).lower() if dev_match else None
                     rtsp_port = (
-                        peer_ports.get(mac, self.cfg.rtsp_port) if mac else self.cfg.rtsp_port
+                        peer_ports.get(mac)
+                        or (peer_ports.get(dev_mac) if dev_mac else None)
+                        or self.cfg.rtsp_port
+                        if mac
+                        else self.cfg.rtsp_port
                     )
                     if self._on_peer_connected is not None:
                         await self._cancel_peer_connect_task()

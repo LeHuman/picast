@@ -478,7 +478,7 @@ class UibcHidcBridge:
         """Send non-blocking or queue remaining bytes via `loop.add_writer`."""
         sock = self._sock
         loop = self._loop
-        if sock is None or loop is None:
+        if self._closed or sock is None or loop is None:
             return False
         if not self._tx_buf:
             try:

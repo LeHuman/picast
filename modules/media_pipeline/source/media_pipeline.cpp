@@ -27,16 +27,6 @@ std::string_view to_string(VideoCodec codec) noexcept {
     }
 }
 
-std::string_view to_string(AudioCodec codec) noexcept {
-    switch (codec) {
-        case AudioCodec::Aac:
-            return "aac";
-        case AudioCodec::Lpcm:
-        default:
-            return "lpcm";
-    }
-}
-
 DecoderBackend resolve_video_decoder(
     const PipelineConfig& cfg,
     const HardwareCapabilities& hw) noexcept {
@@ -107,32 +97,6 @@ namespace {
     }
 }
 
-[[nodiscard]] std::uint32_t resolve_connector_id(
-    const PipelineConfig& cfg,
-    const HardwareCapabilities& hw) noexcept {
-    if (!cfg.drm_connector.empty()) {
-        bool all_digits = true;
-        for (const char ch : cfg.drm_connector) {
-            if (ch < '0' || ch > '9') {
-                all_digits = false;
-                break;
-            }
-        }
-        if (all_digits) {
-            try {
-                return static_cast<std::uint32_t>(std::stoul(cfg.drm_connector));
-            } catch (...) {
-            }
-        }
-        if (hw.drm_connector_id > 0U &&
-            (hw.drm_connector == cfg.drm_connector ||
-             hw.drm_connector.find(cfg.drm_connector) != std::string::npos)) {
-            return hw.drm_connector_id;
-        }
-    }
-    return 0U;
-}
-
 }  // namespace
 
 std::string build_gstreamer_pipeline_description(
@@ -142,10 +106,7 @@ std::string build_gstreamer_pipeline_description(
     const std::string sync_flag = cfg.low_latency_sync ? "false" : "true";
     const std::string video_chain = build_video_decoder_chain(decoder);
 
-    std::string kms_props = std::format("driver-name=vc4 sync={}", sync_flag);
-    if (const std::uint32_t connector_id = resolve_connector_id(cfg, hw); connector_id > 0U) {
-        kms_props += std::format(" connector-id={}", connector_id);
-    }
+    const std::string kms_props = std::format("driver-name=vc4 sync={}", sync_flag);
 
     const std::string source_stage = std::format(
         "appsrc name=ts_src is-live=true do-timestamp=true format=time "
