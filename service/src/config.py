@@ -158,10 +158,17 @@ SETTING_GUIDES: Final[dict[str, SettingGuide]] = {
         summary="Requests an instant keyframe when UDP packets are dropped.",
         recommended="true",
     ),
-    "kms_force_hdmi": SettingGuide(
-        key="kms_force_hdmi",
-        summary="Keeps HDMI signal active across reboots so monitors do not switch inputs.",
-        recommended="true for dedicated displays",
+    "audio_enabled": SettingGuide(
+        key="audio_enabled",
+        summary=(
+            "Enables audio decoding/playback (disable or falls back cleanly on muted HDMI)."
+        ),
+        recommended="true",
+    ),
+    "audio_codec": SettingGuide(
+        key="audio_codec",
+        summary="Advertised WFD audio codec: aac (universal) or lpcm (uncompressed 48kHz).",
+        recommended="aac",
     ),
 }
 
@@ -199,12 +206,9 @@ class PicastConfig:
     tcp_nodelay: bool = True
     idr_on_loss: bool = True
     uibc_enabled: bool = True
-    kms_force_hdmi: bool = False
-    low_resource_mode: bool = True
     rtsp_port: int = 7236
     mice_port: int = 7250
     rtp_port: int = 1028
-    idr_ipc_port: int = 1029
 
     def validated(self) -> PicastConfig:
         """Return a clamped/normalized copy enforcing valid port, PIN, and buffer bounds."""
@@ -236,12 +240,9 @@ class PicastConfig:
             tcp_nodelay=bool(self.tcp_nodelay),
             idr_on_loss=bool(self.idr_on_loss),
             uibc_enabled=bool(self.uibc_enabled),
-            kms_force_hdmi=bool(self.kms_force_hdmi),
-            low_resource_mode=bool(self.low_resource_mode),
             rtsp_port=max(1024, min(65535, int(self.rtsp_port))),
             mice_port=max(1024, min(65535, int(self.mice_port))),
             rtp_port=max(1024, min(65535, int(self.rtp_port))),
-            idr_ipc_port=max(1024, min(65535, int(self.idr_ipc_port))),
         )
 
 

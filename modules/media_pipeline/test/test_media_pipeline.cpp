@@ -57,36 +57,28 @@ void test_decoder_and_pipeline_selection() {
     EXPECT_TRUE(pi5_hevc.find("v4l2slh265dec") != std::string::npos);
 }
 
-void test_dry_run_pipeline_lifecycle() {
-    picast::HardwareCapabilities caps;
-    caps.board = picast::PiBoardModel::PiZero2W;
-    caps.has_v4l2_h264_m2m = true;
-
-    picast::PipelineConfig cfg;
-    cfg.dry_run = true;
-
+void test_inactive_pipeline_lifecycle() {
     picast::MediaPipeline pipe;
-    const auto res = pipe.start(cfg, caps);
-    EXPECT_TRUE(res.has_value());
-    EXPECT_TRUE(pipe.is_running());
+    EXPECT_TRUE(!pipe.is_running());
 
     const std::array<std::uint8_t, 4> dummy_ts{0x47U, 0x00U, 0x00U, 0x00U};
-    EXPECT_TRUE(pipe.push_mpegts(dummy_ts));
+    EXPECT_TRUE(!pipe.push_mpegts(dummy_ts));
 
+    pipe.poll_events();
     pipe.stop();
     EXPECT_TRUE(!pipe.is_running());
 }
 
-void test_latency_defaults_and_queue_bounds() {
+void test_latency_defaults_queue_bounds_and_connector_id() {
     picast::HardwareCapabilities caps;
     caps.board = picast::PiBoardModel::PiZero2W;
     caps.has_v4l2_h264_m2m = true;
+    caps.drm_connector = "card0-HDMI-A-1";
+    caps.drm_connector_id = 32U;
 
     picast::PipelineConfig cfg;
-    // appsrc mode uses `cfg.ts_demux_latency_ms` verbatim (struct default 45 ms):
-    // the app-level jitter buffer already reorders UDP RTP, and the app defaults
-    // this to 0 unless explicitly overridden via `--ts-demux-latency-ms`.
-    const auto appsrc_pipe = picast::build_gstreamer_pipeline_description(cfg, caps, true);
+    // Default struct latency (45 ms); the app sets ts_demux_latency_ms to 0 by default.
+    const auto appsrc_pipe = picast::build_gstreamer_pipeline_description(cfg, caps);
     EXPECT_TRUE(appsrc_pipe.find("appsrc name=ts_src") != std::string::npos);
     EXPECT_TRUE(appsrc_pipe.find("leaky-type=downstream") != std::string::npos);
     EXPECT_TRUE(appsrc_pipe.find("tsdemux name=demux latency=45") != std::string::npos);
@@ -98,32 +90,19 @@ void test_latency_defaults_and_queue_bounds() {
                 != std::string::npos);
 
     cfg.ts_demux_latency_ms = 0U;
-    const auto zero_latency =
-        picast::build_gstreamer_pipeline_description(cfg, caps, true);
+    const auto zero_latency = picast::build_gstreamer_pipeline_description(cfg, caps);
     EXPECT_TRUE(zero_latency.find("tsdemux name=demux latency=0") != std::string::npos);
 
-    // Direct udpsrc path falls back to the historical 45 ms latency when unset.
-    const auto udpsrc_zero = picast::build_gstreamer_pipeline_description(cfg, caps, false, 1028U);
-    EXPECT_TRUE(udpsrc_zero.find("rtpjitterbuffer latency=45") != std::string::npos);
-    EXPECT_TRUE(udpsrc_zero.find("tsdemux name=demux latency=45") != std::string::npos);
-
-    // Explicit override propagates to both rtpjitterbuffer and tsdemux.
-    cfg.ts_demux_latency_ms = 120U;
-    const auto udpsrc_override =
-        picast::build_gstreamer_pipeline_description(cfg, caps, false, 1028U);
-    EXPECT_TRUE(udpsrc_override.find("rtpjitterbuffer latency=120") != std::string::npos);
-    EXPECT_TRUE(udpsrc_override.find("tsdemux name=demux latency=120") != std::string::npos);
-
-    // `kmssink` already defaults `can-scale=true`; the dead drm_connector branch is gone.
-    cfg.drm_connector = "card0-HDMI-A-1";
-    const auto no_can_scale =
-        picast::build_gstreamer_pipeline_description(cfg, caps, true);
-    EXPECT_TRUE(no_can_scale.find("can-scale") == std::string::npos);
+    // Explicit drm_connector matching probed connector propagates connector-id=<n>.
+    cfg.drm_connector = "HDMI-A-1";
+    const auto pinned_conn = picast::build_gstreamer_pipeline_description(cfg, caps);
+    EXPECT_TRUE(pinned_conn.find("connector-id=32") != std::string::npos);
+    EXPECT_TRUE(pinned_conn.find("can-scale") == std::string::npos);
 
     // Default / HDMI ALSA sinks must bypass PipeWire's user-scoped `default` PCM.
-    EXPECT_TRUE(no_can_scale.find("alsasink device=sysdefault") != std::string::npos);
+    EXPECT_TRUE(pinned_conn.find("alsasink device=sysdefault") != std::string::npos);
     cfg.audio_sink = picast::AudioSinkKind::Hdmi;
-    const auto hdmi_audio = picast::build_gstreamer_pipeline_description(cfg, caps, true);
+    const auto hdmi_audio = picast::build_gstreamer_pipeline_description(cfg, caps);
     EXPECT_TRUE(hdmi_audio.find("alsasink device=sysdefault") != std::string::npos);
 }
 
@@ -131,8 +110,8 @@ void test_latency_defaults_and_queue_bounds() {
 
 int main() {
     test_decoder_and_pipeline_selection();
-    test_dry_run_pipeline_lifecycle();
-    test_latency_defaults_and_queue_bounds();
+    test_inactive_pipeline_lifecycle();
+    test_latency_defaults_queue_bounds_and_connector_id();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " assertion(s) failed.\n";

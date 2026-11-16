@@ -19,7 +19,6 @@ struct AppConfig {
     std::uint16_t rtp_port{1028U};
     std::uint16_t idr_port{0U};
     std::uint16_t jitter_ms{45U};
-    bool probe_only{false};
     PipelineConfig pipeline{};
 };
 

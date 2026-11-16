@@ -31,7 +31,7 @@ if(PICAST_ENABLE_GSTREAMER)
 endif()
 
 if(NOT PICAST_HAS_GSTREAMER)
-    message(STATUS "picast_media_pipeline: GStreamer dev headers not found; using portable dry-run backend")
+    message(STATUS "picast_media_pipeline: GStreamer dev headers not found; using no-gstreamer stub backend")
 endif()
 
 file(GLOB_RECURSE MEDIA_PIPELINE_SOURCES CONFIGURE_DEPENDS

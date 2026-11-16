@@ -30,11 +30,9 @@ namespace {
 std::expected<AppConfig, std::string> parse_app_args(std::span<const char* const> args) {
     AppConfig cfg;
     // `RtpJitterBuffer` already reorders out-of-order UDP RTP before `appsrc`,
-    // so `tsdemux` adds no demux-side buffering by default. Historically
-    // `--latency-ms` double-buffered the value into BOTH the jitter buffer and
-    // `tsdemux` (45 ms became 90 ms of glass-to-glass delay); it now tunes the
-    // jitter buffer only, and `--ts-demux-latency-ms` provides an explicit
-    // override (e.g. for the direct `udpsrc` pipeline path).
+    // so `tsdemux` adds no demux-side buffering by default. `--latency-ms` tunes
+    // the jitter buffer only, while `--ts-demux-latency-ms` provides an
+    // explicit demux latency override if needed.
     cfg.pipeline.ts_demux_latency_ms = 0U;
     for (std::size_t i = 1U; i < args.size(); ++i) {
         const std::string_view arg = args[i];
@@ -45,11 +43,7 @@ std::expected<AppConfig, std::string> parse_app_args(std::span<const char* const
             return std::string_view{args[++i]};
         };
 
-        if (arg == "--probe") {
-            cfg.probe_only = true;
-        } else if (arg == "--dry-run") {
-            cfg.pipeline.dry_run = true;
-        } else if (arg == "--no-audio") {
+        if (arg == "--no-audio") {
             cfg.pipeline.enable_audio = false;
         } else if (arg == "--low-latency") {
             cfg.pipeline.low_latency_sync = true;

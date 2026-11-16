@@ -6,6 +6,7 @@
 #include "picast/media_pipeline.hpp"
 
 #include <format>
+#include <iostream>
 #include <mutex>
 #include <utility>
 
@@ -50,9 +51,6 @@ DecoderBackend resolve_video_decoder(
 }
 
 namespace {
-
-/** @brief Historical `tsdemux`/`rtpjitterbuffer` latency used when no explicit override is set. */
-constexpr std::uint16_t kDefaultTsdemuxLatencyMs = 45U;
 
 [[nodiscard]] std::string build_video_decoder_chain(DecoderBackend decoder) {
     // Explicit video/* caps BEFORE `queue` are mandatory: `queue` has `ANY`
@@ -109,44 +107,52 @@ constexpr std::uint16_t kDefaultTsdemuxLatencyMs = 45U;
     }
 }
 
+[[nodiscard]] std::uint32_t resolve_connector_id(
+    const PipelineConfig& cfg,
+    const HardwareCapabilities& hw) noexcept {
+    if (!cfg.drm_connector.empty()) {
+        bool all_digits = true;
+        for (const char ch : cfg.drm_connector) {
+            if (ch < '0' || ch > '9') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) {
+            try {
+                return static_cast<std::uint32_t>(std::stoul(cfg.drm_connector));
+            } catch (...) {
+            }
+        }
+        if (hw.drm_connector_id > 0U &&
+            (hw.drm_connector == cfg.drm_connector ||
+             hw.drm_connector.find(cfg.drm_connector) != std::string::npos)) {
+            return hw.drm_connector_id;
+        }
+    }
+    return 0U;
+}
+
 }  // namespace
 
 std::string build_gstreamer_pipeline_description(
     const PipelineConfig& cfg,
-    const HardwareCapabilities& hw,
-    bool use_appsrc,
-    std::uint16_t udp_port) {
+    const HardwareCapabilities& hw) {
     const DecoderBackend decoder = resolve_video_decoder(cfg, hw);
     const std::string sync_flag = cfg.low_latency_sync ? "false" : "true";
     const std::string video_chain = build_video_decoder_chain(decoder);
 
-    // `kmssink` defaults to `can-scale=true`, so no explicit property is needed.
-    const std::string kms_props = std::format("driver-name=vc4 sync={}", sync_flag);
-
-    std::string source_stage;
-    if (use_appsrc) {
-        // `RtpJitterBuffer` already reorders out-of-order UDP RTP upstream, so
-        // `tsdemux` adds no demux-side latency unless explicitly overridden
-        // (the app defaults `ts_demux_latency_ms` to 0 for this path).
-        source_stage = std::format(
-            "appsrc name=ts_src is-live=true do-timestamp=true format=time "
-            "block=false max-bytes=524288 leaky-type=downstream "
-            "caps=video/mpegts,systemstream=true,packetsize=188 ! "
-            "tsdemux name=demux latency={}",
-            cfg.ts_demux_latency_ms);
-    } else {
-        // Direct `udpsrc` path has no upstream jitter buffer of our own, so
-        // fall back to the historical 45 ms `rtpjitterbuffer`/`tsdemux` latency.
-        const std::uint16_t latency_ms =
-            cfg.ts_demux_latency_ms > 0U ? cfg.ts_demux_latency_ms : kDefaultTsdemuxLatencyMs;
-        source_stage = std::format(
-            "udpsrc port={} buffer-size=4194304 ! "
-            "rtpjitterbuffer latency={} drop-on-latency=false do-lost=true faststart-min-packets=2 ! "
-            "rtpmp2tdepay ! tsdemux name=demux latency={}",
-            udp_port,
-            latency_ms,
-            latency_ms);
+    std::string kms_props = std::format("driver-name=vc4 sync={}", sync_flag);
+    if (const std::uint32_t connector_id = resolve_connector_id(cfg, hw); connector_id > 0U) {
+        kms_props += std::format(" connector-id={}", connector_id);
     }
+
+    const std::string source_stage = std::format(
+        "appsrc name=ts_src is-live=true do-timestamp=true format=time "
+        "block=false max-bytes=524288 leaky-type=downstream "
+        "caps=video/mpegts,systemstream=true,packetsize=188 ! "
+        "tsdemux name=demux latency={}",
+        cfg.ts_demux_latency_ms);
 
     std::string pipeline = std::format(
         "{} "
@@ -176,7 +182,6 @@ std::string build_gstreamer_pipeline_description(
 
 struct MediaPipeline::Impl {
     bool running{false};
-    bool dry_run{false};
     std::string pipeline_desc{};
     ErrorCallback on_error{};
 #if PICAST_HAS_GSTREAMER
@@ -197,40 +202,53 @@ std::expected<void, std::string> MediaPipeline::start(
     const HardwareCapabilities& hw,
     ErrorCallback on_error) {
     stop();
-    impl_->dry_run = cfg.dry_run;
     impl_->on_error = std::move(on_error);
-    impl_->pipeline_desc = build_gstreamer_pipeline_description(cfg, hw, true);
-
-    if (cfg.dry_run) {
-        impl_->running = true;
-        return {};
-    }
+    impl_->pipeline_desc = build_gstreamer_pipeline_description(cfg, hw);
 
 #if PICAST_HAS_GSTREAMER
     static std::once_flag gst_init_once;
     std::call_once(gst_init_once, []() { gst_init(nullptr, nullptr); });
 
-    GError* err = nullptr;
-    GstElement* elem = gst_parse_launch(impl_->pipeline_desc.c_str(), &err);
-    if (err != nullptr || elem == nullptr) {
-        std::string msg = err != nullptr ? err->message : "Failed to construct GStreamer pipeline";
-        if (err != nullptr) {
-            g_error_free(err);
+    auto launch_and_play = [&](const std::string& desc) -> std::expected<void, std::string> {
+        GError* err = nullptr;
+        GstElement* elem = gst_parse_launch(desc.c_str(), &err);
+        if (err != nullptr || elem == nullptr) {
+            std::string msg =
+                err != nullptr ? err->message : "Failed to construct GStreamer pipeline";
+            if (err != nullptr) {
+                g_error_free(err);
+            }
+            if (elem != nullptr) {
+                gst_object_unref(elem);
+            }
+            return std::unexpected(std::move(msg));
         }
-        if (elem != nullptr) {
-            gst_object_unref(elem);
+
+        impl_->pipeline = elem;
+        impl_->appsrc = gst_bin_get_by_name(GST_BIN(elem), "ts_src");
+        impl_->bus = gst_element_get_bus(elem);
+
+        const GstStateChangeReturn ret = gst_element_set_state(impl_->pipeline, GST_STATE_PLAYING);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            stop();
+            return std::unexpected("GStreamer pipeline failed to transition to PLAYING");
         }
-        return std::unexpected(std::move(msg));
+        return {};
+    };
+
+    auto res = launch_and_play(impl_->pipeline_desc);
+    if (!res.has_value() && cfg.enable_audio) {
+        // Monitors without HDMI audio (or locked ALSA devices) fail OPENING
+        // `alsasink` during state transition; fall back cleanly to video-only.
+        std::cerr << "[picast-player] WARN Audio sink failed (" << res.error()
+                  << "); retrying video-only (--no-audio)\n";
+        PipelineConfig muted_cfg = cfg;
+        muted_cfg.enable_audio = false;
+        impl_->pipeline_desc = build_gstreamer_pipeline_description(muted_cfg, hw);
+        res = launch_and_play(impl_->pipeline_desc);
     }
-
-    impl_->pipeline = elem;
-    impl_->appsrc = gst_bin_get_by_name(GST_BIN(elem), "ts_src");
-    impl_->bus = gst_element_get_bus(elem);
-
-    const GstStateChangeReturn ret = gst_element_set_state(impl_->pipeline, GST_STATE_PLAYING);
-    if (ret == GST_STATE_CHANGE_FAILURE) {
-        stop();
-        return std::unexpected("GStreamer pipeline failed to transition to PLAYING");
+    if (!res.has_value()) {
+        return res;
     }
 
     impl_->running = true;
@@ -244,9 +262,6 @@ std::expected<void, std::string> MediaPipeline::start(
 bool MediaPipeline::push_mpegts(std::span<const std::uint8_t> ts_bytes) {
     if (!impl_->running || ts_bytes.empty()) {
         return false;
-    }
-    if (impl_->dry_run) {
-        return true;
     }
 
 #if PICAST_HAS_GSTREAMER

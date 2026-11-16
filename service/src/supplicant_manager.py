@@ -27,10 +27,7 @@ _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _IPV4_RE = r"\d+(?:\.\d+){3}"
 CONF_PATH = Path("/run/picast/wpa/picast-wpa.conf")
 PID_PATH = Path("/run/picast/wpa/wpa_supplicant.pid")
-# Persistent on purpose: /run/picast is a systemd RuntimeDirectory (wiped on
-# unit stop and on power-cycle), which destroyed the evidence of every lockout.
-LOG_PATH = Path("/var/lib/picast/wpa_supplicant.log")
-LOG_PREV_PATH = Path("/var/lib/picast/wpa_supplicant.log.prev")
+LOG_PATH = Path("/run/picast/wpa/wpa_supplicant.log")
 
 
 def _nmcli_active_connection(interface: str) -> str | None:
@@ -86,12 +83,14 @@ def parse_nm_keyfile(text: str) -> dict[str, dict[str, str]]:
     return sections
 
 
-def scan_nm_keyfiles(
+def scan_nm_wifi_credentials(
     conn_dirs: tuple[str, ...] | list[str],
-    groups: tuple[str, ...],
-    key: str,
-) -> str | None:
-    """First non-empty `key=` in `groups` across `*.nmconnection` files in `conn_dirs`."""
+) -> tuple[str, str | None] | None:
+    """Return `(ssid, psk)` read from the *same* `.nmconnection` file in `conn_dirs`.
+
+    Scanning SSID and PSK independently across files risks pairing open
+    Network A's SSID with Network B's PSK.
+    """
     for conn_dir in conn_dirs:
         directory = Path(conn_dir)
         if not directory.is_dir():
@@ -105,10 +104,21 @@ def scan_nm_keyfiles(
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            for group in groups:
-                value = parse_nm_keyfile(text).get(group, {}).get(key, "")
-                if value:
-                    return value
+            sections = parse_nm_keyfile(text)
+            ssid = ""
+            for group in _SSID_GROUPS:
+                ssid = sections.get(group, {}).get("ssid", "")
+                if ssid:
+                    break
+            if not ssid:
+                continue
+            psk: str | None = None
+            for group in _PSK_GROUPS:
+                candidate = sections.get(group, {}).get("psk", "")
+                if candidate:
+                    psk = candidate
+                    break
+            return ssid, psk
     return None
 
 
@@ -121,11 +131,17 @@ def read_host_regdom(path: Path = _REGDOM_PATH) -> str:
     return value if len(value) == 2 and value.isalpha() and value.isupper() else "US"
 
 
-def read_active_ssid(interface: str) -> str | None:
-    """Read the station SSID from NM (active connection first, then keyfiles)."""
+def _escape_wpa_string(value: str) -> str:
+    """Escape backslashes and double quotes for double-quoted wpa_supplicant fields."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def read_active_wifi_credentials(interface: str) -> tuple[str | None, str | None]:
+    """Read `(ssid, psk)` together from NM's active connection or matching keyfile."""
     conn = _nmcli_active_connection(interface)
     nmcli = shutil.which("nmcli")
     if conn and nmcli:
+        ssid = ""
         try:
             res = subprocess.run(
                 [nmcli, "-g", "802-11-wireless.ssid", "connection", "show", conn],
@@ -134,34 +150,35 @@ def read_active_ssid(interface: str) -> str | None:
                 text=True,
                 timeout=5.0,
             )
+            if res.returncode == 0:
+                ssid = res.stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
-            res = None
-        if res is not None and res.returncode == 0 and res.stdout.strip():
-            return res.stdout.strip()
-    return scan_nm_keyfiles(_NM_CONN_DIRS, _SSID_GROUPS, "ssid")
-
-
-def read_active_psk(interface: str) -> str | None:
-    """Read the station PSK from NM (connection property, then keyfile fallback)."""
-    conn = _nmcli_active_connection(interface)
-    nmcli = shutil.which("nmcli")
-    if conn and nmcli:
-        try:
-            res = subprocess.run(
-                [
-                    nmcli, "--show-secrets", "-g", "802-11-wireless-security.psk",
-                    "connection", "show", conn,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            res = None
-        if res is not None and res.returncode == 0 and res.stdout.strip():
-            return res.stdout.strip()
-    return scan_nm_keyfiles(_NM_CONN_DIRS, _PSK_GROUPS, "psk")
+            ssid = ""
+        if ssid:
+            psk: str | None = None
+            try:
+                psk_res = subprocess.run(
+                    [
+                        nmcli,
+                        "--show-secrets",
+                        "-g",
+                        "802-11-wireless-security.psk",
+                        "connection",
+                        "show",
+                        conn,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                if psk_res.returncode == 0 and psk_res.stdout.strip():
+                    psk = psk_res.stdout.strip()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return ssid, psk
+    creds = scan_nm_wifi_credentials(_NM_CONN_DIRS)
+    return creds if creds is not None else (None, None)
 
 
 def build_supplicant_config(
@@ -176,19 +193,20 @@ def build_supplicant_config(
     Mirrors the proven NM-free test configuration (GO intent 15, display device
     type). `config_methods` is chosen by PIN mode (`push_button` for zero-PIN,
     display/keypad otherwise). PSKs that are 64 hex chars are written unquoted (the
-    precomputed PBKDF2 hash form); passphrases are backslash/quote-escaped.
+    precomputed PBKDF2 hash form); SSIDs and passphrases are backslash/quote-escaped.
     `country` should come from `read_host_regdom()` so the autonomous GO follows
     the live cfg80211 regulatory domain instead of hardcoding `US`.
     """
+    escaped_ssid = _escape_wpa_string(ssid)
     if psk:
         if _HEX64_RE.fullmatch(psk):
             psk_line = f"\t\tpsk={psk}\n"
         else:
-            escaped = psk.replace("\\", "\\\\").replace('"', '\\"')
-            psk_line = f'\t\tpsk="{escaped}"\n'
-        network = f'\tnetwork={{\n\t\tssid="{ssid}"\n{psk_line}\t}}\n'
+            escaped_psk = _escape_wpa_string(psk)
+            psk_line = f'\t\tpsk="{escaped_psk}"\n'
+        network = f'\tnetwork={{\n\t\tssid="{escaped_ssid}"\n{psk_line}\t}}\n'
     else:
-        network = f'\tnetwork={{\n\t\tssid="{ssid}"\n\t\tkey_mgmt=NONE\n\t}}\n'
+        network = f'\tnetwork={{\n\t\tssid="{escaped_ssid}"\n\t\tkey_mgmt=NONE\n\t}}\n'
     return (
         "ctrl_interface=DIR=/run/picast/wpa GROUP=netdev\n"
         f"country={country}\n"
@@ -238,6 +256,27 @@ def read_station_lease(interface: str) -> tuple[str, str | None]:
     return addr, gw
 
 
+def read_station_dns(interface: str) -> list[str]:
+    """Capture IPv4 DNS servers assigned to `interface` before stopping NetworkManager."""
+    nmcli = shutil.which("nmcli")
+    if not nmcli:
+        return []
+    servers: list[str] = []
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        res = subprocess.run(
+            [nmcli, "-g", "IP4.DNS", "device", "show", interface],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if res.returncode == 0:
+            for token in re.split(r"[\s|]+", res.stdout.strip()):
+                if re.fullmatch(_IPV4_RE, token) and token not in servers:
+                    servers.append(token)
+    return servers
+
+
 @dataclass(slots=True)
 class SupplicantManager:
     """Runs a dedicated wpa_supplicant so NM cannot reap the autonomous P2P GO.
@@ -256,6 +295,7 @@ class SupplicantManager:
     _wpa_stopped: bool = field(default=False, init=False)
     _lease_addr: str = field(default="", init=False)
     _lease_gw: str | None = field(default=None, init=False)
+    _lease_dns: list[str] = field(default_factory=list, init=False)
 
     def _ping(self) -> bool:
         reply = wpa_request(CTRL_DIR, self.interface, "PING", timeout_s=3.0)
@@ -335,11 +375,37 @@ class SupplicantManager:
             self._lease_addr,
             f" via {self._lease_gw}" if self._lease_gw else "",
         )
+        if self._lease_dns:
+            resolvectl = shutil.which("resolvectl")
+            if resolvectl:
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    subprocess.run(
+                        [resolvectl, "dns", self.interface, *self._lease_dns],
+                        check=False,
+                        capture_output=True,
+                        timeout=3.0,
+                    )
+
+    def _capture_lease_with_wait(self, timeout_s: float = 3.0) -> None:
+        """Capture station IPv4 lease/DNS, waiting briefly if NM DHCP is still settling."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            addr, gw = read_station_lease(self.interface)
+            if addr:
+                self._lease_addr = addr
+                self._lease_gw = gw
+                self._lease_dns = read_station_dns(self.interface)
+                return
+            if time.monotonic() >= deadline:
+                self._lease_addr = ""
+                self._lease_gw = None
+                self._lease_dns = []
+                return
+            time.sleep(0.25)
 
     def start(self) -> bool:
         """Take over the radio: credentials -> stop NM -> private supplicant."""
-        ssid = read_active_ssid(self.interface)
-        psk = read_active_psk(self.interface)
+        ssid, psk = read_active_wifi_credentials(self.interface)
         if not ssid:
             logger.warning(
                 "No active Wi-Fi association found on %s; keeping system supplicant",
@@ -353,7 +419,8 @@ class SupplicantManager:
 
         # Capture the live lease BEFORE stopping NetworkManager: NM's teardown
         # kills its DHCP client, and the private supplicant only restores L2.
-        self._lease_addr, self._lease_gw = read_station_lease(self.interface)
+        wait_s = 3.0 if _nmcli_active_connection(self.interface) else 0.0
+        self._capture_lease_with_wait(timeout_s=wait_s)
 
         systemctl = shutil.which("systemctl")
         if systemctl:
@@ -379,11 +446,8 @@ class SupplicantManager:
             "utf-8",
         )
         CONF_PATH.chmod(0o600)
-        # Keep exactly one previous run's log (bounded SD-card use).
         with contextlib.suppress(OSError):
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            if LOG_PATH.exists():
-                LOG_PATH.replace(LOG_PREV_PATH)
         try:
             # Foreground (NO -B): Popen must own the real process so stop() works;
             # with -B the parent exits instantly and the orphaned daemon keeps

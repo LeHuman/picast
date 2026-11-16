@@ -12,11 +12,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import PicastConfig, PinMode
+from .config import PicastConfig, PinMode, WifiBandMode
 from .platform import (
     HostCapabilities,
     apply_runtime_wifi_tuning,
-    resolve_p2p_ht40_allowed,
     resolve_p2p_oper_freq,
 )
 from .splash import PinManager
@@ -26,9 +25,12 @@ from .wpa_ctrl import WpaCtrlMonitor, wpa_request
 logger = logging.getLogger(__name__)
 P2P_GATEWAY_IP = "192.168.173.1"
 P2P_CLIENT_IP = "192.168.173.80"
+_LEASE_FILE = Path("/run/picast/dnsmasq.leases")
 _P2P_IFACE_RE = re.compile(r"Interface\s+(p2p-[^\s]+)")
 _FREQ_RE = re.compile(r"^freq=(\d+)$", re.MULTILINE)
 _WFD_DEV_INFO_RE = re.compile(r"wfd_dev_info=0x([0-9a-fA-F]{12})")
+_MAC_RE = re.compile(r"\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b")
+_IPV4_RE = re.compile(r"^\d+(?:\.\d+){3}$")
 # `wps_registrar_add_pin()` in hostap registers a hardcoded 120s
 # (`WPS_PBC_WALK_TIME`) `wps_registrar_set_selected_timeout` that clears
 # `reg->selected_registrar = 0` in the GO Beacon/Probe Response WPS IE even
@@ -52,6 +54,12 @@ def parse_station_freq(wpa_status_output: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def parse_peer_mac(msg: str) -> str | None:
+    """Extract the first normalized lowercase MAC address from a wpa_supplicant event."""
+    match = _MAC_RE.search(msg)
+    return match.group(1).lower() if match else None
+
+
 def parse_orphan_p2p_interfaces(iw_dev_output: str) -> list[str]:
     """Extract created GO `p2p-*` netdevs from `iw dev`, ignoring persistent `p2p-dev-*`."""
     return [
@@ -61,14 +69,48 @@ def parse_orphan_p2p_interfaces(iw_dev_output: str) -> list[str]:
     ]
 
 
+def find_lease_ip_for_mac(lease_file: Path, mac: str) -> str | None:
+    """Return the leased IPv4 address for `mac` in `dnsmasq.leases`, if present."""
+    target_mac = mac.lower()
+    try:
+        lines = lease_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        parts = line.split()
+        if len(parts) >= 3 and parts[1].lower() == target_mac and _IPV4_RE.fullmatch(parts[2]):
+            return parts[2]
+    return None
+
+
+def resolve_leased_ip(
+    lease_file: Path, mac: str | None = None, default_ip: str = P2P_CLIENT_IP
+) -> str:
+    """Resolve connecting P2P peer's IPv4 from `dnsmasq.leases`, falling back cleanly."""
+    if mac:
+        matched = find_lease_ip_for_mac(lease_file, mac)
+        if matched is not None:
+            return matched
+    try:
+        lines = lease_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return default_ip
+    for line in reversed(lines):
+        parts = line.split()
+        if len(parts) >= 3 and _IPV4_RE.fullmatch(parts[2]):
+            return parts[2]
+    return default_ip
+
+
 def build_dnsmasq_args(p2p_iface: str, lease_file: Path) -> list[str]:
-    """Build deterministic single-IP DHCP server arguments for Windows Wi-Fi Direct."""
+    """Build DHCP-only `dnsmasq` arguments (`--port=0` avoids :53 conflicts)."""
     return [
         "dnsmasq",
         "--no-daemon",
+        "--port=0",
         "--bind-interfaces",
         f"--interface={p2p_iface}",
-        "--dhcp-range=192.168.173.80,192.168.173.80,255.255.255.0,5m",
+        "--dhcp-range=192.168.173.80,192.168.173.120,255.255.255.0,5m",
         "--dhcp-option=3,192.168.173.1",
         "--dhcp-option=6,192.168.173.1",
         f"--dhcp-leasefile={lease_file}",
@@ -85,11 +127,13 @@ class WifiP2pManager:
     caps: HostCapabilities
     pin_manager: PinManager
     _dnsmasq_proc: asyncio.subprocess.Process | None = field(default=None, init=False)
+    _dnsmasq_log_task: asyncio.Task[None] | None = field(default=None, init=False)
     _p2p_group_iface: str | None = field(default=None, init=False)
     _paused_for_session: bool = field(default=False, init=False)
     _supplicant: SupplicantManager | None = field(default=None, init=False)
     _ctrl_dir: str | None = field(default=None, init=False)
     _wps_keepalive_task: asyncio.Task[None] | None = field(default=None, init=False)
+    _peer_connect_task: asyncio.Task[None] | None = field(default=None, init=False)
     _on_peer_connected: Callable[[str, int], Awaitable[None]] | None = field(
         default=None, init=False
     )
@@ -225,17 +269,27 @@ class WifiP2pManager:
         apply_runtime_wifi_tuning(self.cfg.p2p_interface, self.cfg.wifi_power_save)
 
         freq = resolve_p2p_oper_freq(self.cfg, self.caps)
-        if freq < 5000:
-            # Single-radio 2.4 GHz: a fixed GO channel that differs from the
-            # station's channel makes brcmfmac tear the GO down instantly
-            # (chanspec -52 / AP-DISABLED; beacon never goes out). Follow the
-            # live station channel (legacy lazycast behavior), else let
-            # wpa_supplicant choose (omit freq=).
-            station_freq = parse_station_freq(
-                self._run_wpa("status", iface=self.cfg.p2p_interface)
-            )
-            freq = station_freq if station_freq and 2400 < station_freq < 2500 else 0
-        ht40_arg = ["ht40"] if resolve_p2p_ht40_allowed(self.cfg, self.caps) else []
+        station_freq = parse_station_freq(
+            self._run_wpa("status", iface=self.cfg.p2p_interface)
+        )
+        if station_freq is not None and (2400 < station_freq < 2500 or 5000 <= station_freq < 6000):
+            if (
+                self.cfg.wifi_band is not WifiBandMode.AUTO
+                and (freq >= 5000) != (station_freq >= 5000)
+            ):
+                logger.warning(
+                    "Configured P2P band (%d MHz) differs from station channel (%d MHz); "
+                    "aligning GO to %d MHz to avoid single-radio MCC dropouts",
+                    freq,
+                    station_freq,
+                    station_freq,
+                )
+            freq = station_freq
+        elif freq < 5000:
+            # No active station frequency on 2.4 GHz: let wpa_supplicant pick auto channel.
+            freq = 0
+        ht40_allowed = bool(self.cfg.ht40 and self.caps.supports_ht40 and freq >= 5000)
+        ht40_arg = ["ht40"] if ht40_allowed else []
         logger.info(
             "Starting P2P GO on %s (HT40=%s)",
             f"{freq} MHz" if freq else "auto channel",
@@ -346,19 +400,51 @@ class WifiP2pManager:
         if not dnsmasq_bin:
             logger.warning("dnsmasq not found; Windows Wi-Fi Direct DHCP unavailable")
             return
-        lease_file = Path("/run/picast/dnsmasq.leases")
         try:
-            lease_file.parent.mkdir(parents=True, exist_ok=True)
-            args = build_dnsmasq_args(p2p_iface, lease_file)
+            _LEASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            args = build_dnsmasq_args(p2p_iface, _LEASE_FILE)
             self._dnsmasq_proc = await asyncio.create_subprocess_exec(
                 dnsmasq_bin,
                 *args[1:],
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.sleep(0.05)
+            if self._dnsmasq_proc.returncode is not None:
+                err_bytes = (
+                    await self._dnsmasq_proc.stderr.read()
+                    if self._dnsmasq_proc.stderr is not None
+                    else b""
+                )
+                logger.error(
+                    "dnsmasq exited early on %s (rc=%s): %s",
+                    p2p_iface,
+                    self._dnsmasq_proc.returncode,
+                    err_bytes.decode("utf-8", errors="replace").strip(),
+                )
+                self._dnsmasq_proc = None
+                return
+            self._dnsmasq_log_task = asyncio.create_task(
+                self._drain_dnsmasq_stderr(self._dnsmasq_proc),
+                name="picast-dnsmasq-stderr",
             )
             logger.info("Started dnsmasq on %s", p2p_iface)
         except OSError as exc:
             logger.warning("Failed starting dnsmasq on %s: %s", p2p_iface, exc)
+
+    @staticmethod
+    async def _drain_dnsmasq_stderr(proc: asyncio.subprocess.Process) -> None:
+        if proc.stderr is None:
+            return
+        try:
+            while line := await proc.stderr.readline():
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    logger.debug("dnsmasq: %s", text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     def set_scan_suppression(self, active_session: bool) -> None:
         """Keep background Wi-Fi scan activity off the single radio while streaming."""
@@ -374,6 +460,37 @@ class WifiP2pManager:
         """Non-blocking scan suppression toggle off the asyncio event loop."""
         await asyncio.to_thread(self.set_scan_suppression, active_session)
 
+    async def _notify_peer_connected(self, mac: str | None, rtsp_port: int) -> None:
+        """Resolve connecting peer's leased IP from `dnsmasq.leases` then fire callback."""
+        if self._on_peer_connected is None:
+            return
+        peer_ip = P2P_CLIENT_IP
+        if mac is not None:
+            deadline = asyncio.get_running_loop().time() + 3.0
+            while True:
+                matched = await asyncio.to_thread(find_lease_ip_for_mac, _LEASE_FILE, mac)
+                if matched is not None:
+                    peer_ip = matched
+                    break
+                if (
+                    self._dnsmasq_proc is None
+                    or self._dnsmasq_proc.returncode is not None
+                    or asyncio.get_running_loop().time() >= deadline
+                ):
+                    peer_ip = await asyncio.to_thread(resolve_leased_ip, _LEASE_FILE, mac)
+                    break
+                await asyncio.sleep(0.2)
+        else:
+            peer_ip = await asyncio.to_thread(resolve_leased_ip, _LEASE_FILE, None)
+        await self._on_peer_connected(peer_ip, rtsp_port)
+
+    async def _cancel_peer_connect_task(self) -> None:
+        if self._peer_connect_task is not None and not self._peer_connect_task.done():
+            self._peer_connect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._peer_connect_task
+        self._peer_connect_task = None
+
     async def _wps_keepalive_loop(self, group_iface: str) -> None:
         """Keep `Selected Registrar = 1` alive and re-arm immediately on PD/WPS events.
 
@@ -388,7 +505,7 @@ class WifiP2pManager:
             logger.info("Attached WPS event monitor to %s/global", self._ctrl_dir)
         else:
             monitor = None
-        peer_rtsp_port = self.cfg.rtsp_port
+        peer_ports: dict[str, int] = {}
 
         try:
             while True:
@@ -411,18 +528,22 @@ class WifiP2pManager:
                     msg = msg.split(">", 1)[1].strip()
 
                 if msg.startswith("P2P-DEVICE-FOUND"):
+                    mac = parse_peer_mac(msg)
                     wfd_match = _WFD_DEV_INFO_RE.search(msg)
-                    if wfd_match:
+                    if mac and wfd_match:
                         port = int(wfd_match.group(1)[4:8], 16)
                         if port > 0:
-                            peer_rtsp_port = port
+                            peer_ports[mac] = port
 
                 if any(msg.startswith(ev) for ev in _WPS_REARM_EVENTS):
                     logger.info("P2P/WPS event (%s); refreshing WPS registrar", msg.split()[0])
                     if msg.startswith("AP-STA-DISCONNECTED"):
-                        # A disconnected peer's advertised RTSP port must never
-                        # leak into the `_on_peer_connected` of the NEXT peer.
-                        peer_rtsp_port = self.cfg.rtsp_port
+                        mac = parse_peer_mac(msg)
+                        if mac:
+                            peer_ports.pop(mac, None)
+                        else:
+                            peer_ports.clear()
+                        await self._cancel_peer_connect_task()
                         if self._on_peer_disconnected is not None:
                             await self._on_peer_disconnected()
                     if msg.startswith("P2P-PROV-DISC-PBC-REQ"):
@@ -433,13 +554,22 @@ class WifiP2pManager:
                     logger.info("P2P/WPS milestone: %s", msg)
                 elif msg.startswith("AP-STA-CONNECTED"):
                     logger.info("P2P/WPS milestone: %s", msg)
+                    mac = parse_peer_mac(msg)
+                    rtsp_port = (
+                        peer_ports.get(mac, self.cfg.rtsp_port) if mac else self.cfg.rtsp_port
+                    )
                     if self._on_peer_connected is not None:
-                        await self._on_peer_connected(P2P_CLIENT_IP, peer_rtsp_port)
+                        await self._cancel_peer_connect_task()
+                        self._peer_connect_task = asyncio.create_task(
+                            self._notify_peer_connected(mac, rtsp_port),
+                            name="picast-p2p-peer-connect",
+                        )
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("WPS keepalive monitor failed")
         finally:
+            await self._cancel_peer_connect_task()
             if monitor is not None:
                 await monitor.close()
 
@@ -450,6 +580,12 @@ class WifiP2pManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._wps_keepalive_task
             self._wps_keepalive_task = None
+        await self._cancel_peer_connect_task()
+        if self._dnsmasq_log_task is not None:
+            self._dnsmasq_log_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._dnsmasq_log_task
+            self._dnsmasq_log_task = None
         if self._dnsmasq_proc is not None and self._dnsmasq_proc.returncode is None:
             self._dnsmasq_proc.terminate()
             try:

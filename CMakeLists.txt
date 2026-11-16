@@ -44,7 +44,7 @@ install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/picast-restore-network.s
 set(CPACK_GENERATOR "DEB")
 set(CPACK_PACKAGE_NAME "picast")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_PACKAGE_VENDOR "LeHuman")
+set(CPACK_PACKAGE_VENDOR "picast")
 set(CPACK_PACKAGE_CONTACT "picast maintainers <maintainers@example.invalid>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Modern low-latency Miracast (Wi-Fi Display & MICE) receiver for Raspberry Pi OS Trixie")
 set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")

@@ -43,16 +43,6 @@ enum class AudioSinkKind {
     PipeWire,
 };
 
-/** @brief Filesystem paths inspected during platform probing (overridable in unit tests). */
-struct ProbePaths {
-    std::filesystem::path device_tree_model{"/proc/device-tree/model"};
-    std::filesystem::path cpuinfo{"/proc/cpuinfo"};
-    std::filesystem::path drm_sysfs{"/sys/class/drm"};
-    std::filesystem::path dev_dir{"/dev"};
-    std::filesystem::path v4l2_sysfs{"/sys/class/video4linux"};
-    std::filesystem::path override_edid{};
-};
-
 /** @brief Aggregated runtime hardware and display capabilities for the active host. */
 struct HardwareCapabilities {
     PiBoardModel board{PiBoardModel::Unknown};
@@ -66,6 +56,7 @@ struct HardwareCapabilities {
     std::string v4l2_h264_device{};
     std::string v4l2_hevc_device{};
     std::string drm_connector{};
+    std::uint32_t drm_connector_id{0U};
     DecoderBackend recommended_h264{DecoderBackend::SoftwareNeonH264};
     std::vector<std::uint8_t> edid{};
 };
@@ -114,9 +105,8 @@ struct HardwareCapabilities {
 
 /**
  * @brief Probe board model, V4L2 decode nodes, radio capabilities, and DRM EDID state.
- * @param paths Optional path overrides (defaults inspect live procfs/sysfs/devfs).
  * @return Populated `HardwareCapabilities` structure.
  */
-[[nodiscard]] HardwareCapabilities probe_hardware(const ProbePaths& paths = {});
+[[nodiscard]] HardwareCapabilities probe_hardware();
 
 }  // namespace picast

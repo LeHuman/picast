@@ -1,81 +1,76 @@
-# picast Modernization & Trixie Execution Plan
+# picast Post-Reset Audit, Cleanup & Refactoring Plan
 
-> **Purpose:** Finalized engineering, build-verification, and live Raspberry Pi testing handoff for an off-site execution agent (`picast`, successor fork of `LeHuman/lazycast`, now `LeHuman/picast`). The architecture cleanly separates the **C++26 media engine** (`app/` + `modules/*`, each independently buildable/testable with `CMakeLists.txt` + `test/` and statically linked with Release LTO + `--gc-sections`) from the **Python 3.13+ systemd control service & CLI** (`service/`), unified under root `CMakeLists.txt` to compile, validate, test, and package an immediately runnable `.deb` (`picast.service` → `/usr/bin/picast run` → `picast-player`).
-
----
-
-## 1. Confirmed Architectural Decisions & Technical Rationale
-
-1. **Two-Component Split Unified by Root CMake (`app/` + `modules/` + `service/`):**
-   - **Data Plane (`app/`, `modules/`):** C++26 (`CMAKE_CXX_STANDARD 26`, GCC 14 Trixie ABI-compatible), safety-critical patterns (pre-allocated circular `RtpJitterBuffer` with zero hot-path allocations, `std::span`, `std::expected`, `[[nodiscard]]`, `noexcept`, RAII `SocketGuard`, full Doxygen docstrings).
-   - **Control Service (`service/`):** Self-contained Python 3.13+ package (`service/CMakeLists.txt`, `service/pyproject.toml`, `service/src/`, `service/test/`). Root CMake triggers `service/` syntax validation, runs `picast.service_tests` in CTest (when `pytest` is installed), and installs the Python library, `/usr/bin/picast`, `/lib/systemd/system/picast.service`, and `/etc/picast/picast.conf` into the `.deb`.
-2. **Target Platform Discipline (RPi / Trixie Only Receiver):**
-   - Windows 10/11 is strictly a Miracast sender (`WIN + K`), never a receiver; all `#ifdef _WIN32`/Winsock code has been stripped. Windows/x86_64 dev machines build and test using **WSL2** or **Docker (`debian:trixie-slim`)** via simplified presets (`debug`, `release`, `rpi-arm64`, `rpi-pi5`).
-3. **Target Hardware, Radio & Codec Realities:**
-   - **Pi Zero 2 W (Primary, 512 MB RAM):** Hardware H.264 decode (`/dev/video10` `v4l2h264dec capture-io-mode=4` -> `kmssink`). **Radio is 2.4 GHz only**; `HT40` stays **off** on Zero 2 W to prevent 2.4 GHz OBSS coexistence degradation. Rated for **1080p30**.
-   - **Pi 4 & Pi 5 (Secondary):** Dual-band **5 GHz** (non-DFS ch `36` / `5180 MHz` default) + optional `HT40` + `1080p60`. **Pi 5 lacks HW H.264 decode** (uses NEON `avdec_h264`), **but CAN hardware-decode HEVC** (`/dev/video19` `v4l2slh265dec`).
-   - **WFD 1.0 vs WFD 2.0 HEVC:** Always advertise **H.264** universally; offer `wfd2_video_formats` conditionally on Pi 4/5 when the Windows sender supports WFD 2.0 HEVC.
-4. **Exclusive Display Ownership & UX Polish:**
-   - No Wayland/`labwc` overhead: `picast.service` claims `tty1` / DRM directly (`multi-user.target`, `Nice=-10`, `OOMScoreAdjust=-500`) and `picast service disable` restores graphical boot cleanly if needed.
-   - **Color-Block Splash (`splash.py`):** Oversized high-contrast pixel-block typography to `/dev/fb0` (32-bpp mmap) or `/dev/tty1` ANSI blocks.
-   - **PIN Policy:** **`per-reboot`** default (`/run/picast/pin`), plus `per-session`, `fixed:<8-digits>`, and `none` (`PBC`).
-   - **KMS Always-On HDMI (`picast display force-hdmi` / `capture-edid`):** Updates `/boot/firmware/cmdline.txt` safely with backup.
-5. **Audit Fixes Applied:**
-   - Wired `WifiP2pManager.start()` to await creation of the `p2p-wl*-*` group interface, arm `wps_pin`/`wps_pbc` directly on the group netdev, and spawn `dnsmasq` single-IP DHCP.
-   - Parsed real M6 `Session:` ID and M4 `wfd_presentation_URL`, and added the UDP loopback IDR listener (`idr_ipc_port`) forwarding `wfd_idr_request` during packet loss.
-   - Added MS-MICE v1 `SOURCE_READY` TLV parsing in `MiceService` triggering outbound RTSP connection to the Windows sender under `Session Lock`.
+**Status:** Executed (all approved removals, bug fixes, and refactorings applied; see §4 for executed log and verification scope)
+**Baseline Verification:** Verified directly against all active files in workspace root after reset. Confirmed `.archive/` contains 0 files (empty directory skeleton only); zero findings originate from `.archive/` or mixed old/new file states.
 
 ---
 
-## 2. Off-Site Agent Remaining Execution Checklist
+## 1. Removals of Testing / Probing-Only Additions & Dead Artifacts
 
-### Phase 0: Local Git Normalization & Commits
-- [ ] Verify `.gitignore` keeps `.agent/LOCAL_SETUP.md` and AI Studio harness files (`package.json`, `index.html`, `vite.config.ts`, `tsconfig.json`, `metadata.json`, `node_modules/`, `dist/`) untracked (`git status --ignored`).
-- [ ] Add upstream remote and rename `master` -> `main` while keeping `upstream/master` fetchable:
-  ```bash
-  git remote add upstream https://github.com/homeworkc/lazycast.git
-  git fetch upstream
-  git branch -m master main
-  git push -u origin main
-  ```
-- [ ] Split and commit changes cleanly with **Conventional Commits + Gitmojis** (short messages):
-  - `✨ feat(cmake): add modular C++26/LTO CMake, service CMake, and .deb CPack config`
-  - `✨ feat(modules): implement platform_probe, rtp_jitter, media_pipeline, and unit tests`
-  - `✨ feat(app): implement picast-player POSIX receiver and CLI argument parser`
-  - `♻️ refactor(service): implement typed Python 3.13+ daemon, WFD/MICE, splash, and CLI`
-  - `👷 ci: add GitHub Actions QA, standalone module build check, and Trixie .deb pipeline`
-  - `🔥 chore: remove retired legacy lazycast scripts and OpenMAX C sources`
-  - `📝 docs: update README to PMPi standard for picast`
+| # | Target | Finding & Reasoning | Proposed Change |
+|---|--------|---------------------|-----------------|
+| R1 | `tools/wfd_source_harness.py`, `tools/splash_preview.py` | Manual dev/test harnesses not installed by CMake or used by `picast` runtime (`splash_preview.py` also hardcoded a local developer checkout path). | Remove `tools/` directory (or move out of repo if kept external). |
+| R2 | `.archive/` | Empty leftover directory skeleton after repo reset (0 files). | Delete empty `.archive/` tree. |
+| R3 | `--probe` (`app/include/picast/app_config.hpp:22`, `app/source/app_config.cpp:48-49`, `app/source/main.cpp:104-116`, `.vscode/launch.json:25-32`) | Manual hardware probing flag inside `picast-player`. Unused by `picast` daemon, `picast doctor`, or `systemd`; Python already probes hardware in `service/src/platform.py` and `service/src/edid.py`. | Remove `probe_only`, `--probe`, and the `.vscode/launch.json` `--probe` debug target. Keep `picast doctor` for operator diagnostics. |
+| R4 | `--dry-run` (`app/source/app_config.cpp:50-51`, `modules/media_pipeline/include/picast/media_pipeline.hpp:40,97,111`, `modules/media_pipeline/source/media_pipeline.cpp:179,200,204-207,248-250`) | Production CLI flag and `PipelineConfig::dry_run` branch exist solely so `test_app_config.cpp` and `test_media_pipeline.cpp` can exercise `start()`/`push_mpegts()` without GStreamer. | Remove `--dry-run` and `PipelineConfig::dry_run` from runtime config/CLI; test GStreamer-less pipeline lifecycle via `#if !PICAST_HAS_GSTREAMER` or a test-only double/helper in `test_media_pipeline.cpp`. |
+| R5 | Dead `use_appsrc = false` / `udp_port` path (`modules/media_pipeline/include/picast/media_pipeline.hpp:73-81`, `modules/media_pipeline/source/media_pipeline.cpp:117-149`, `app/source/app_config.cpp:37`) | `MediaPipeline::start()` hardcodes `use_appsrc = true` (`media_pipeline.cpp:202`). The `udpsrc ! rtpjitterbuffer` branch is an unreferenced legacy/A-B test path exercised only in `test_media_pipeline.cpp:105-115`. | Remove `use_appsrc` / `udp_port` parameters and direct `udpsrc` builder branch; simplify `build_gstreamer_pipeline_description(cfg, hw)`. Audit whether `--ts-demux-latency-ms` (added for that path) should stay or be fixed at `0`. |
+| R6 | `ProbePaths` override struct (`modules/platform_probe/include/picast/platform_probe.hpp:47-54`) & unused `override_edid` | Explicitly annotated `(overridable in unit tests)`, yet `main.cpp` never passes custom `ProbePaths` and `test_platform_probe.cpp` does not even use it (only calls `read_drm_edid("/nonexistent_picast_drm_path")`). Meanwhile, `/lib/firmware/picast-edid.bin` captured by `picast display capture-edid` is only read in Python, not C++. | Either strip `ProbePaths` from public API (unless `test_platform_probe.cpp` is expanded to test sysfs fixtures) and remove dead `override_edid` or wire `/lib/firmware/picast-edid.bin` cleanly if C++ needs it. |
+| R7 | Persistent SD-card supplicant log (`service/src/supplicant_manager.py:30-33,382-400`) | Added to preserve lockout forensics (`LOG_PATH = /var/lib/picast/wpa_supplicant.log`, `-f` flag + `LOG_PREV_PATH`), bypassing `journald` and wearing the Pi SD card on chatty P2P/WPS scans. | Remove persistent `/var/lib/picast/wpa_supplicant.log*` forensics logging once P2P is stable (log to stdout/stderr → `journald` or `/run/picast/` volatile runtime dir). |
 
-### Phase 1: Compilation, Static Analysis & Packaging Verification
-- [ ] Run Linux Debug build + all C++ & Python CTests (natively, in WSL2, or Docker):
-  ```bash
-  cmake --preset debug -DPICAST_WARNINGS_AS_ERRORS=ON
-  cmake --build --preset debug -j"$(nproc)"
-  ctest --preset debug
-  ```
-- [ ] Verify standalone per-module build & test composability (`platform_probe`, `rtp_jitter`, `media_pipeline`, `app`, `service`):
-  ```bash
-  cmake -S modules/rtp_jitter -B build/standalone-rtp -G Ninja -DPICAST_WARNINGS_AS_ERRORS=ON
-  cmake --build build/standalone-rtp && ctest --test-dir build/standalone-rtp --output-on-failure
-  ```
-- [ ] Verify `service/` QA suite cleanly under Python 3.13:
-  ```bash
-  cd service && python -m pip install -e ".[dev]" && ruff check src test && mypy && pytest
-  ```
-- [ ] Build the `arm64` `.deb` (via `docker run --platform linux/arm64 ... debian:trixie-slim` or directly on Pi) and inspect `.deb` contents (`dpkg-deb -c dist/picast-*.deb`) to confirm `/usr/bin/picast-player`, `/usr/bin/picast`, `/usr/lib/picast/python/picast/*.py`, `/lib/systemd/system/picast.service`, and `/etc/picast/picast.conf` are all present and executable.
+---
 
-### Phase 2: Real Hardware Spike & Live Streaming Verification (`Pi Zero 2 W` & `Pi 5` via `.agent/LOCAL_SETUP.md`)
-- [ ] Install built `.deb` (`sudo apt install ./dist/picast_*.deb`) on **Pi Zero 2 W** and **Pi 5** running stock Raspberry Pi OS Lite (Trixie, `arm64`).
-- [ ] Run `sudo picast configure`, `sudo picast doctor`, and `sudo picast service enable`; confirm `systemctl status picast.service` runs cleanly with splash visible on `tty1`/HDMI and `v4l2h264dec capture-io-mode=4 ! kmssink` (Zero 2 W) / `avdec_h264` or `v4l2slh265dec` + `kmssink` (Pi 5).
-- [ ] Verify NetworkManager coexistence under Trixie: confirm `p2p-dev-wlan0` GO group does not get torn down (`AP-DISABLED`) by NetworkManager and `iw event` shows zero background Wi-Fi scanning during casting (add a scoped NM pause/unmanaged rule in `wifi_p2p.py` if Trixie NM interferes).
-- [ ] Check for **brcmfmac dual-IP quirk** on Zero 2 W (`192.168.173.1/24` on `wlan0` if Windows fails TCP `:7236` reachability across `p2p-wl*`).
-- [ ] End-to-end **Windows 10/11 `WIN + K`** test over **Wi-Fi Direct (`p2p`)** and **MICE (`mice` / `both`)**:
-  - Verify WPS PIN entry with `per-reboot` PIN & color-block splash on `/dev/fb0` and `/dev/tty1`
-  - Confirm `picast-player` video + audio playback, IDR packet-loss recovery (`wfd_idr_request`), and clean disconnect/lock release back to splash
-  - Verify WFD 2.0 HEVC negotiation vs H.264 fallback on Pi 5
-  - Verify `sudo picast display force-hdmi` + `capture-edid` persistence across reboots, and `sudo picast service disable` restore behavior.
+## 2. Confirmed Bugs & Fragile Workarounds (Active Files Only)
 
-### Phase 3: Stretch Goals (Post-MVP)
-- [ ] **`UibcInput` Module (`modules/uibc_input/`):** Port `evdev` mouse/keyboard capture forwarding over Windows TCP HIDC without X11 (`Xlib`).
-- [ ] **`armhf` Benchmark Target:** Add a 32-bit `armhf` build preset & CI matrix entry to benchmark 32-bit RSS memory savings vs `arm64` on 512 MB Pi Zero 2 W.
+| # | Location | Bug / Hack | Proposed Fix |
+|---|----------|------------|--------------|
+| B1 | `service/src/wifi_p2p.py:64-77, 28, 437` | `build_dnsmasq_args()` omits `--port=0` (attempts DNS `:53` bind, colliding with `systemd-resolved`, stderr swallowed by `DEVNULL`). Single-IP range `.80,.80,5m` + hardcoded `P2P_CLIENT_IP` locks out any reconnect with randomized MAC within 5 min. | Add `--port=0`; widen DHCP pool (e.g. `192.168.173.80,192.168.173.120,5m`); resolve peer IP from `/run/picast/dnsmasq.leases` by STA MAC from `AP-STA-CONNECTED` (falling back to `.80`). Surface `dnsmasq` stderr on non-zero exit. |
+| B2 | `service/src/wifi_p2p.py:391, 413-427, 437` | `_wps_keepalive_loop` tracks one scalar `peer_rtsp_port` overwritten by *any* neighboring `P2P-DEVICE-FOUND` frame. | Store `peer_ports: dict[str, int]` keyed by normalized peer MAC from `P2P-DEVICE-FOUND` and look up the connecting MAC on `AP-STA-CONNECTED`. |
+| B3 | `service/src/wifi_p2p.py:227-237` | `_setup_p2p_group_sync()` only checks `station_freq` when `freq < 5000`. On Pi 4/5 (`wifi_band=auto` -> `5180`), if `wlan0` STA is on 2.4 GHz or another 5 GHz channel, it forces cross-channel MCC on `brcmfmac`. | Compare `station_freq` unconditionally; when STA is associated on a valid band/channel, align GO frequency (or warn/follow STA band) instead of assuming `< 5000` means 2.4 GHz-only conflict. |
+| B4 | `service/src/wpa_ctrl.py:134` | `WpaCtrlMonitor.attach()` binds `picast-mon-{os.getpid()}` without `_CLIENT_SEQ`, risking socket collision across multiple monitors. `recv_event()` also returns `""` on peer EOF without marking closed. | Reuse `_CLIENT_SEQ` (`picast-mon-{pid}-{seq}`) and detect `raw == b""` EOF cleanly. |
+| B5 | `service/src/supplicant_manager.py:89-164, 189` | `scan_nm_keyfiles()` grabs the first `ssid` and first `psk` independently across sorted `*.nmconnection` files (can pair Network A's SSID with Network B's PSK if Network A is open). `build_supplicant_config()` escapes `"` and `\` in `psk` (`lines 187-188`) but not `ssid` (`line 189`). | Read `ssid` and `psk` together from the *same* `.nmconnection` file matching the preferred/active connection; escape `ssid` identically to `psk`. |
+| B6 | `service/src/supplicant_manager.py:203-239, 306-338` | Stopping NM kills DHCP client and DNS management; manual `ip addr/route replace` snapshot fails if `wlan0` had no lease yet at service start, drops DHCP renewals, and leaves DNS unmanaged. | See Re-Architecture A1 below (NM `unmanaged-devices` or NM native P2P / `systemd-networkd` DHCP client). |
+| B7 | `service/src/rtsp_session.py:499` | `"wfd2_video_formats" in text` blindly sets `negotiated_codec = "h265"`, even for `wfd2_video_formats: none` or WFD2 H.264 (`02 02`). | Parse the `wfd2_video_formats:` value explicitly and only switch to `"h265"` when non-`none` and profile indicates HEVC (`02 01` / codec field check). |
+| B8 | `service/src/rtsp_session.py:525-541` | When `runner.start()` returns `False`, RTSP still sends `M6 SETUP` and `M7 PLAY` with no active media player. | If `not await runner.start(...)`, abort/return from `handle_rtsp_connection()` cleanly instead of sending `SETUP`/`PLAY`. |
+| B9 | `service/src/rtsp_session.py:266`, `config.py:197,202,203,207` | M3 hardcodes `wfd_audio_codecs: AAC 00000001 00` ignoring `cfg.audio_codec == "lpcm"`. Dead/misleading config keys: `idr_ipc_port` (daemon binds port `0`), `kms_force_hdmi` (never read at runtime), `low_resource_mode` (never read at runtime). | Emit matching `LPCM 00000003 00` or `AAC` per `cfg.audio_codec`; remove dead config keys (`idr_ipc_port`, `kms_force_hdmi`, `low_resource_mode`) or wire them intentionally; expose `audio_enabled`/`audio_codec` in `configure`. |
+| B10 | `service/src/uibc.py:443, 470-496` | `sock.settimeout(2.0)` puts TCP HIDC socket in blocking mode, and `_on_input_ready()` calls `sock.sendall(packet)` synchronously on the `asyncio` event loop thread—stalling RTSP/MICE keepalives up to 2 s under Wi-Fi packet loss. | Replace raw blocking `socket` with `asyncio.StreamWriter` (`loop.create_connection`) + bounded non-blocking send queue (or drop stale pointer motion deltas on backpressure). |
+| B11 | `modules/media_pipeline/source/media_pipeline.cpp:158-165, 230-234` | ALSA open failure on HDMI monitors without audio speakers (`alsasink device=sysdefault`) fails `GST_STATE_CHANGE_PLAYING`, killing the entire video stream. | Catch `GST_STATE_CHANGE_FAILURE` (or probe audio/retry once) and fall back cleanly with `enable_audio = false` (`fakesink`), logging a single warning. |
+| B12 | `modules/media_pipeline/hpp:42` & `.cpp:124` | `PipelineConfig::drm_connector` is populated (`platform_probe.cpp:301`) and noted in `test_media_pipeline.cpp`, yet ignored by `kmssink` assembly. | Either wire `connector-id=` lookup / connector selection for multi-HDMI Pi 4/5 or remove the unused field from `PipelineConfig`. |
+| B13 | `service/src/splash.py:533-570` & `daemon.py:76,120` | `run_splash_animation()` rebuilds/writes the entire 4.1–8.3 MB framebuffer at 10 Hz in pure Python while holding the GIL (`Nice=-10`). `SplashState.ip_hint` is passed in `daemon.py:120`, dropped in `_start_splash_animation()`, and never rendered anywhere. | Dirty-rectangle blitting / mmap `/dev/fb0` (updating only changed stars + `WIN + K` box) or lower-cost static attract; either render `ip_hint` or remove the dead field. |
+| B14 | `packaging/picast-restore-network.sh:8-9` | `pkill -f 'picast-wpa.conf'` can kill unrelated processes whose command line contains that substring (e.g., an editor/cat). | Terminate specifically via `/run/picast/wpa/wpa_supplicant.pid` (`--pidfile`) with `--exact wpa_supplicant` fallback. |
+
+---
+
+## 3. Architectural / Maintainability Refactoring Proposals
+
+1. **Replace `SupplicantManager`'s Global `systemctl stop NetworkManager` + Static IP Snapshot (High Value):**
+   - *Option A (Minimal intrusion):* Drop-in `/etc/NetworkManager/conf.d/99-picast-unmanaged.conf` (or dynamic `nmcli device set wlan0 managed no` / NM `unmanaged-devices=interface-name:wlan0;interface-name:p2p-*`) + lightweight DHCP client (`dhcpcd` / `systemd-networkd` / `dhclient`) instead of stopping NM globally (which currently breaks Ethernet/`eth0` management, DHCP lease renewal, and DNS).
+   - *Option B (Ideal native integration):* Investigate driving NM's `org.freedesktop.NetworkManager.Device.WifiP2P` D-Bus API or a `wifi-p2p` NM connection profile so NM itself manages both station and GO without conflicting with D-Bus.
+   - *Note:* Either change removes ~250 lines of NM keyfile scraping, PID chasing, `picast-restore-network.sh`, and static lease snapshot fragility.
+
+2. **Split `wifi_p2p.py` (`475` lines) & `rtsp_session.py` (`587` lines) Along Clear Boundaries:**
+   - Extract `service/src/wfd_protocol.py` (pure stateless WFD/WFD2 M3/M4 parsers & formatters, `RtspStreamFramer`) from `rtsp_session.py` (async socket/subprocess session orchestration).
+   - Extract `DhcpServer` helper (`dnsmasq` lifecycle + lease parser) and `WpsRegistrarLoop` from `wifi_p2p.py`.
+
+3. **Unify Hardware & EDID Probing Between Python and C++26:**
+   - Decide single source of truth: either have `picast-player` accept resolved flags/EDID from Python (shrinking `platform_probe`), OR keep `platform_probe` for C++ standalone parity while deriving constants consistently. Currently both `platform.py`/`edid.py` and `platform_probe.cpp` re-implement board detection, V4L2 sysfs scans, and DRM EDID parsing independently (and already diverged on `/lib/firmware/picast-edid.bin` support).
+
+---
+
+## 4. Change Log (Reasoning Tracker)
+- **2026-11-16 (Initial Post-Reset Audit):** Inspected all files in `app/`, `modules/`, `service/`, `packaging/`, `tools/`, `.vscode/`, `.github/`. Confirmed `.archive/` is empty (0 files). Documented all test/probing-only removals (`R1–R7`), active correctness bugs (`B1–B14`), and refactoring options (`§3`) prior to making any code modifications.
+- **2026-11-16 (Executed Batch 1 — Removals, C++26 Pipeline, & WFD Protocol):**
+  - Removed test/probing-only artifacts: deleted `/tools` (`R1`), deleted empty `/.archive` (`R2`), stripped `--probe` / `probe_only` and `.vscode/launch.json` `--probe` target (`R3`), stripped `--dry-run` / `PipelineConfig::dry_run` (`R4`, updating `modules/media_pipeline/CMakeLists.txt` message too), removed dead `use_appsrc = false` / `udpsrc` branch (`R5`), and removed `ProbePaths` override while wiring `/lib/firmware/picast-edid.bin` fallback and `drm_connector_id` sysfs read in `platform_probe` (`R6`, `§3.3`).
+  - Wired `connector-id=<id>` lookup into `kmssink` (`B12`) and automatic video-only retry (`enable_audio = false` -> `fakesink`) when ALSA playback fails `GST_STATE_CHANGE_PLAYING` (`B11`).
+  - Extracted stateless protocol helpers into `service/src/wfd_protocol.py` (`§3.2`), fixed `wfd2_video_formats: none` / `02 02` H.264 misdetection (`B7`), aborted RTSP `M6 SETUP` + `M7 PLAY` if `runner.start()` fails (`B8`), emitted matching `LPCM 00000003 00` or `AAC 00000001 00` in M3 per `cfg.audio_codec`, removed dead `idr_ipc_port`, `kms_force_hdmi`, `low_resource_mode` config keys, and exposed `audio_enabled` / `audio_codec` in `cli.py configure` (`B9`).
+- **2026-11-16 (Executed Batch 2 — Wi-Fi P2P, Supplicant, UIBC, Splash, & Tests):**
+  - `service/src/wifi_p2p.py`: Added `--port=0` and widened DHCP pool `192.168.173.80..120` in `build_dnsmasq_args()`, added `find_lease_ip_for_mac()` / `resolve_leased_ip()` + stderr surfacing/draining (`B1`), tracked peer RTSP port per MAC in `peer_ports: dict[str, int]` (`B2`), and aligned GO frequency unconditionally to `station_freq` with HT40 gated on resolved `freq >= 5000` (`B3`).
+  - `service/src/wpa_ctrl.py`: Bound `picast-mon-{pid}-{seq}` using `_CLIENT_SEQ` and closed cleanly on socket EOF/`OSError` (`B4`).
+  - `service/src/supplicant_manager.py` & `packaging/picast-restore-network.sh`: Moved supplicant log to volatile `/run/picast/wpa/wpa_supplicant.log` (`R7`), replaced independent keyfile scans with coherent `scan_nm_wifi_credentials()` + `read_active_wifi_credentials()`, escaped `ssid` in `build_supplicant_config()` (`B5`), added `read_station_dns()` + lease wait before NM stop (`B6`, keeping proven `SupplicantManager` lifecycle for Trixie Lite compatibility instead of introducing external DHCP packages), and narrowed `picast-restore-network.sh` cleanup to `/run/picast/wpa/wpa_supplicant.pid` + exact process match (`B14`).
+  - `service/src/uibc.py`: Removed `sock.settimeout(2.0)`, converted descriptor handshakes to `loop.sock_sendall`, and added bounded non-blocking TX queue flushed via `loop.add_writer` (`B10`).
+  - `service/src/splash.py` & `service/src/daemon.py`: Removed unused `SplashState.ip_hint` and replaced 10 Hz full-framebuffer rebuilds/writes with `_FbSplashAnimator` dirty-rectangle `os.pwrite` updates (`B13`).
+  - `service/test/test_picast.py`: Updated tests for coherent NM credential scanning and added coverage for WFD2 codec parsing, LPCM M3 audio, `dnsmasq` flags/lease resolution, escaped SSIDs, volatile log path, non-blocking UIBC TX flushing, and pixel-identical dirty-rect splash updates.
+- **2026-11-16 (Verification Scope in Sandbox):**
+  - Passed: Python 3 AST syntax check across all `.py` files under `service/`, 100-character line-length check, unused-import AST audit, repo-wide grep for stale removed symbols, and direct runtime assertion execution (`enum.StrEnum` shimmed for Python 3.10 container) validating `_FbSplashAnimator` (16-bpp & 32-bpp), `is_wfd2_hevc_selected`, `build_wfd_m3_response`, `scan_nm_wifi_credentials`, `build_supplicant_config`, `build_dnsmasq_args`, `resolve_leased_ip`, `parse_peer_mac`, and `UibcHidcBridge` TX queueing.
+  - Pending Target/CI Execution: `cmake`/`ctest` (no C++ compiler/CMake installed in container) and full `pytest`/`ruff`/`mypy` (host container has Python 3.10.12 only; target requires Python 3.13+).
+- **2026-11-16 (PII Sanitization Pass):**
+  - Replaced personal maintainer handle in `CMakeLists.txt` (`CPACK_PACKAGE_VENDOR`) and removed the personal repository `Documentation=` URL from `packaging/picast.service`, and scrubbed local developer path reference from `PLAN.md`. Confirmed zero personal emails, usernames, real credentials, or private hostnames remain across source, packaging, and CI files.

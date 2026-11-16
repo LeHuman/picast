@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import random
 import secrets
 import threading
@@ -170,7 +171,6 @@ class SplashState:
     transport_label: str
     pin_display: str
     status_line: str
-    ip_hint: str = ""
 
 
 def render_color_block_text(text: str, fg_code: str = "97", on_char: str = "██") -> list[str]:
@@ -530,6 +530,100 @@ def _write_fb0_splash(state: SplashState, fb_path: Path = Path("/dev/fb0")) -> b
         return False
 
 
+def _winkey_band_offsets(width: int, height: int, bpp: int) -> tuple[int, int]:
+    """Return `(start_byte_offset, end_byte_offset)` covering the blinking `WIN + K` band."""
+    pin_scale = max(4, width // 60)
+    pin_y = max(0, (height - 7 * pin_scale) // 2 - height // 16)
+    device_scale = max(3, width // 160)
+    winkey_y = max(0, pin_y + 7 * pin_scale + height // 18)
+    end_y = min(height, winkey_y + 7 * device_scale)
+    stride = width * (bpp // 8)
+    return winkey_y * stride, max(winkey_y, end_y) * stride
+
+
+class _FbSplashAnimator:
+    """Dirty-rectangle splash animator avoiding 10 Hz full-screen Python redraws."""
+
+    def __init__(self, width: int, height: int, bpp: int) -> None:
+        self.width = width
+        self.height = height
+        self.bpp = bpp
+        self.bytes_per_px = bpp // 8
+        self.stride = width * self.bytes_per_px
+        self._bg_pixel = _fb_pattern(_FB_BG_PIXEL, bpp)
+        self._band_start, self._band_end = _winkey_band_offsets(width, height, bpp)
+        self._cached_state: SplashState | None = None
+        self._active_canvas: bytearray | None = None
+        self._bright_band = b""
+        self._dim_band = b""
+        self._is_bright = True
+        self._prev_star_rects: list[tuple[int, int]] = []
+
+    def render_tick(
+        self,
+        state: SplashState,
+        phase: float,
+        field: StarField,
+        now_s: float,
+        write_fn: Callable[[int, bytes | bytearray], object],
+    ) -> None:
+        is_bright = (phase % 1.0) < 0.5
+        if self._cached_state != state or self._active_canvas is None:
+            bright_canvas = build_fb_canvas(
+                state, self.width, self.height, phase=0.0, starfield=None, bpp=self.bpp
+            )
+            dim_canvas = build_fb_canvas(
+                state, self.width, self.height, phase=0.5, starfield=None, bpp=self.bpp
+            )
+            self._bright_band = bytes(bright_canvas[self._band_start : self._band_end])
+            self._dim_band = bytes(dim_canvas[self._band_start : self._band_end])
+            self._active_canvas = bright_canvas if is_bright else dim_canvas
+            self._cached_state = state
+            self._is_bright = is_bright
+            self._prev_star_rects.clear()
+            write_fn(0, self._active_canvas)
+        else:
+            band_flipped = is_bright != self._is_bright
+            if band_flipped:
+                band = self._bright_band if is_bright else self._dim_band
+                self._active_canvas[self._band_start : self._band_end] = band
+                write_fn(self._band_start, band)
+                self._is_bright = is_bright
+            for off, span_bytes in self._prev_star_rects:
+                if band_flipped and self._band_start <= off < self._band_end:
+                    continue
+                write_fn(off, self._active_canvas[off : off + span_bytes])
+            self._prev_star_rects.clear()
+
+        active = self._active_canvas
+        for star in field.stars:
+            age = max(0.0, min(now_s - star.born, star.lifetime_s))
+            brightness = star.peak * math.sin(math.pi * age / star.lifetime_s)
+            if brightness <= 0.0 or star.x < 0 or star.x >= self.width:
+                continue
+            span = min(star.size_px, self.width - star.x)
+            if span <= 0:
+                continue
+            star_pixel = _fb_pattern(_scale_color(_FB_STAR_COLOR, brightness), self.bpp)
+            star_row = star_pixel * span
+            bg_row = self._bg_pixel * span
+            span_bytes = span * self.bytes_per_px
+            for dy in range(star.size_px):
+                py = star.y + dy
+                if py < 0 or py >= self.height:
+                    continue
+                off = py * self.stride + star.x * self.bytes_per_px
+                if active[off : off + span_bytes] == bg_row:
+                    write_fn(off, star_row)
+                    self._prev_star_rects.append((off, span_bytes))
+                else:
+                    for k in range(span):
+                        p_off = off + k * self.bytes_per_px
+                        if active[p_off : p_off + self.bytes_per_px] == self._bg_pixel:
+                            write_fn(p_off, star_pixel)
+                            self._prev_star_rects.append((p_off, self.bytes_per_px))
+
+
 def run_splash_animation(
     state_factory: Callable[[], SplashState],
     stop_event: threading.Event,
@@ -537,37 +631,43 @@ def run_splash_animation(
     tick_s: float = 0.10,
     blink_period_s: float = 1.0,
     rng: random.Random | None = None,
+    fb_path: Path = Path("/dev/fb0"),
 ) -> None:
     """Blocking game-attract loop for a daemon thread: pulsing WIN + K plus twinkling stars.
 
-    Rebuilds and rewrites the full framebuffer every tick into its native pixel
-    format (no conversion pass) — ~4.1 MB per frame at 1080p 16-bpp — so a 0.1 s
-    tick keeps the twinkle smooth on a Zero 2 W. Without a usable fb0 this returns
+    Paints the full static canvas once, then applies dirty-rectangle `os.pwrite`
+    updates for twinkling stars and half-cycle `WIN + K` flips to keep CPU/GIL
+    usage negligible on a Pi Zero 2 W. Without a usable fb0 this returns
     immediately; the TTY fallback never animates.
     """
-    geometry = fb0_geometry()
+    geometry = fb0_geometry(fb_path)
     if geometry is None:
         return
     width, height, bpp = geometry
     field = StarField(
         width, height, rng if rng is not None else random.Random(), bpp=bpp
     )
+    animator = _FbSplashAnimator(width, height, bpp)
     t0 = time.monotonic()
 
-    while not stop_event.is_set():
-        now = time.monotonic()
-        phase = ((now - t0) / blink_period_s) % 1.0
-        field.tick(now)
-        canvas = build_fb_canvas(
-            state_factory(), width, height, phase=phase, starfield=field, bpp=bpp
-        )
-        try:
-            with Path("/dev/fb0").open("r+b", buffering=0) as fb:
-                fb.write(canvas)
-        except OSError as exc:
-            logger.debug("Splash animation write failed; stopping (%s)", exc)
-            return
-        stop_event.wait(tick_s)
+    try:
+        with fb_path.open("r+b", buffering=0) as fb:
+            fd = fb.fileno()
+
+            def _pwrite(offset: int, data: bytes | bytearray) -> None:
+                view = memoryview(data)
+                written = 0
+                while written < len(view):
+                    written += os.pwrite(fd, view[written:], offset + written)
+
+            while not stop_event.is_set():
+                now = time.monotonic()
+                phase = ((now - t0) / blink_period_s) % 1.0
+                field.tick(now)
+                animator.render_tick(state_factory(), phase, field, now, _pwrite)
+                stop_event.wait(tick_s)
+    except OSError as exc:
+        logger.debug("Splash animation write failed; stopping (%s)", exc)
 
 
 def render_splash(state: SplashState, tty_path: Path = Path("/dev/tty1")) -> None:

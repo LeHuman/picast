@@ -1,38 +1,48 @@
-"""Asyncio RTSP M1-M7 / WFD 2.0 state machine, TCP Content-Length framer, and IDR watchdog."""
+"""Asyncio RTSP M1-M7 / WFD 2.0 session orchestration and IDR watchdog."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
-import re
 import shutil
 import socket
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Protocol
 
-from .config import CodecPreference, PicastConfig, SyncMode
-from .edid import (
-    DisplayTimingSummary,
-    build_wfd2_video_formats,
-    build_wfd_video_formats,
-    inspect_display,
-)
-from .platform import (
-    HostCapabilities,
-    resolve_effective_fps,
-    resolve_wfd2_hevc_enabled,
-)
+from .config import PicastConfig, SyncMode
+from .edid import inspect_display
+from .platform import HostCapabilities, resolve_wfd2_hevc_enabled
 from .uibc import UibcHidcBridge
+from .wfd_protocol import (
+    RtspStreamFramer,
+    build_wfd_m3_response,
+    extract_cseq,
+    extract_session_id,
+    format_rtsp_response,
+    is_wfd2_hevc_selected,
+    parse_client_rtp_port,
+    parse_presentation_url,
+    parse_uibc_port,
+)
+
+__all__ = [
+    "PlayerProcessRunner",
+    "RtspStreamFramer",
+    "SessionEventSink",
+    "build_wfd_m3_response",
+    "extract_cseq",
+    "extract_session_id",
+    "format_rtsp_response",
+    "handle_rtsp_connection",
+    "is_wfd2_hevc_selected",
+    "parse_client_rtp_port",
+    "parse_presentation_url",
+    "parse_uibc_port",
+]
 
 logger = logging.getLogger(__name__)
-MAX_RTSP_BUFFER_BYTES: Final[int] = 65536
-_CSEQ_RE = re.compile(rb"CSeq:\s*(\d+)", re.IGNORECASE)
-_SESSION_RE = re.compile(r"Session:\s*([^\s;]+)", re.IGNORECASE)
-_PRES_URL_RE = re.compile(r"wfd_presentation_URL:\s*([^\s\r\n]+)", re.IGNORECASE)
-_TRANSPORT_PORTS_RE = re.compile(r"client_port=(\d+)(?:-(\d+))?")
-_UIBC_CAPABILITY_RE = re.compile(r"wfd_uibc_capability:\s*([^\r\n]+)", re.IGNORECASE)
 
 
 class SessionEventSink(Protocol):
@@ -40,111 +50,6 @@ class SessionEventSink(Protocol):
 
     async def on_session_started(self, peer_ip: str) -> None: ...
     async def on_session_ended(self, peer_ip: str) -> None: ...
-
-
-class RtspStreamFramer:
-    """Incremental TCP parser assembling bounded header+Content-Length RTSP frames."""
-
-    def __init__(self, max_buffer_bytes: int = MAX_RTSP_BUFFER_BYTES) -> None:
-        self._buf = bytearray()
-        self._max_buffer_bytes = max_buffer_bytes
-
-    def feed(self, chunk: bytes) -> list[bytes]:
-        """Append incoming TCP bytes and emit any complete RTSP messages."""
-        if not chunk:
-            return []
-        if len(self._buf) + len(chunk) > self._max_buffer_bytes:
-            self._buf.clear()
-            raise ValueError(f"RTSP frame exceeded {self._max_buffer_bytes} bytes")
-        self._buf.extend(chunk)
-        messages: list[bytes] = []
-
-        while True:
-            sep_idx = self._buf.find(b"\r\n\r\n")
-            sep_len = 4
-            if sep_idx == -1:
-                sep_idx = self._buf.find(b"\n\n")
-                sep_len = 2
-            if sep_idx == -1:
-                break
-
-            header_bytes = bytes(self._buf[:sep_idx])
-            content_length = 0
-            for raw_line in header_bytes.splitlines():
-                lower = raw_line.lower()
-                if lower.startswith(b"content-length:"):
-                    try:
-                        content_length = max(0, int(raw_line.split(b":", 1)[1].strip()))
-                    except ValueError:
-                        content_length = 0
-
-            total_len = sep_idx + sep_len + content_length
-            if total_len > self._max_buffer_bytes:
-                self._buf.clear()
-                raise ValueError(f"Declared RTSP frame length {total_len} exceeds limit")
-            if len(self._buf) < total_len:
-                break
-
-            frame = bytes(self._buf[:total_len])
-            del self._buf[:total_len]
-            messages.append(frame)
-
-        return messages
-
-
-def extract_cseq(message: bytes) -> str:
-    """Extract `CSeq` dynamically from incoming RTSP packets (falling back to `1`)."""
-    match = _CSEQ_RE.search(message)
-    return match.group(1).decode("ascii") if match else "1"
-
-
-def extract_session_id(message_text: str, fallback: str = "12345678") -> str:
-    """Extract RTSP `Session:` identifier returned by Windows in M6 `SETUP` response."""
-    match = _SESSION_RE.search(message_text)
-    return match.group(1).strip() if match else fallback
-
-
-def parse_presentation_url(message_text: str, peer_ip: str) -> str:
-    """Extract `wfd_presentation_URL` from M4 `SET_PARAMETER`, defaulting to peer IP."""
-    match = _PRES_URL_RE.search(message_text)
-    if match:
-        candidate = match.group(1).strip()
-        if candidate.startswith("rtsp://"):
-            return candidate
-    return f"rtsp://{peer_ip}/wfd1.0/streamid=0"
-
-
-def parse_client_rtp_port(message_text: str, default_port: int = 1028) -> int:
-    """Extract negotiated UDP RTP port from WFD M4/M6 `client_port=` header."""
-    match = _TRANSPORT_PORTS_RE.search(message_text)
-    if not match:
-        return default_port
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return default_port
-
-
-def parse_uibc_port(message_text: str) -> int | None:
-    """Extract the source's HIDC `port=<N>` from M4 `wfd_uibc_capability:`.
-
-    Returns `None` when the line is absent, when the source advertises
-    `port=none` (no UIBC offered), or when the value is not a usable TCP port,
-    matching upstream `d2.py`'s `'none' not in uibcport` gate.
-    """
-    match = _UIBC_CAPABILITY_RE.search(message_text)
-    if not match:
-        return None
-    for item in match.group(1).split(";"):
-        item = item.strip()
-        if not item.lower().startswith("port="):
-            continue
-        raw = item.split("=", 1)[1].strip()
-        if raw.lower() == "none" or not raw.isdigit():
-            return None
-        port = int(raw)
-        return port if 1 <= port <= 65535 else None
-    return None
 
 
 @dataclass(slots=True)
@@ -159,20 +64,19 @@ class PlayerProcessRunner:
         cfg: PicastConfig,
         rtp_port: int,
         video_codec: str,
-        idr_port: int | None = None,
+        idr_port: int = 0,
     ) -> bool:
         resolved = shutil.which(self.binary_path) or "/usr/bin/picast-player"
         if not Path(resolved).exists():
             logger.error("picast-player binary not found at %s", resolved)
             return False
 
-        effective_idr_port = idr_port if idr_port is not None else cfg.idr_ipc_port
         args = [
             resolved,
             "--rtp-port",
             str(rtp_port),
             "--idr-port",
-            str(effective_idr_port),
+            str(idr_port),
             "--latency-ms",
             str(cfg.jitter_ms),
             "--codec",
@@ -227,105 +131,6 @@ class _IdrUdpProtocol(asyncio.DatagramProtocol):
             self._queue.put_nowait(msg)
 
 
-def build_wfd_m3_response(
-    requested_body: str,
-    cfg: PicastConfig,
-    caps: HostCapabilities,
-    rtp_port: int,
-    allow_uibc: bool = False,
-    display_info: DisplayTimingSummary | None = None,
-) -> str:
-    """Build WFA M3 `GET_PARAMETER` response with universal H.264 + optional WFD 2.0 HEVC.
-
-    `requested_body` is parsed into an exact line `set[str]` (never substring
-    matching, so `wfd2_video_formats` cannot falsely satisfy `wfd_video_formats`).
-    `display_info` is optional so a caller can inspect the display once per RTSP
-    connection instead of once per M3 request.
-    """
-    effective_fps = resolve_effective_fps(cfg, caps)
-    video_formats = build_wfd_video_formats(cfg.max_resolution, effective_fps)
-    info = display_info if display_info is not None else inspect_display()
-    requested_params = {ln.strip() for ln in requested_body.splitlines() if ln.strip()}
-
-    lines: list[str] = []
-    if "wfd_video_formats" in requested_params:
-        lines.append(f"wfd_video_formats: {video_formats}")
-    if "wfd2_video_formats" in requested_params:
-        if resolve_wfd2_hevc_enabled(cfg, caps):
-            hevc_flag = cfg.codec is not CodecPreference.H264
-            wfd2_fmt = build_wfd2_video_formats(cfg.max_resolution, effective_fps, hevc=hevc_flag)
-            lines.append(f"wfd2_video_formats: {wfd2_fmt}")
-        else:
-            lines.append("wfd2_video_formats: none")
-    if "wfd_audio_codecs" in requested_params:
-        # Primary Sink (0x0011) MUST advertise at least one mandatory WFD audio
-        # codec; returning `wfd_audio_codecs: none` makes Windows 10 abort RTSP
-        # at M3. Advertise AAC 48kHz 2ch (matching upstream `d2.py` GStreamer
-        # mode): when `cfg.audio_enabled` is False, `picast-player --no-audio`
-        # leaves the MPEG-TS audio PID unlinked so `alsasink` is never opened.
-        lines.append("wfd_audio_codecs: AAC 00000001 00")
-    if "wfd_3d_video_formats" in requested_params:
-        lines.append("wfd_3d_video_formats: none")
-    if "wfd_content_protection" in requested_params:
-        lines.append("wfd_content_protection: none")
-    if "wfd_coupled_sink" in requested_params:
-        lines.append("wfd_coupled_sink: none")
-    if "wfd_connector_type" in requested_params:
-        lines.append("wfd_connector_type: 05")
-    if "wfd_uibc_capability" in requested_params:
-        lines.append(
-            "wfd_uibc_capability: input_category_list=GENERIC, HIDC;"
-            "generic_cap_list=Keyboard, Mouse;"
-            "hidc_cap_list=Keyboard/USB, Mouse/USB;port=none"
-            if allow_uibc
-            else "wfd_uibc_capability: none"
-        )
-    if "wfd_client_rtp_ports" in requested_params:
-        lines.append(f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {rtp_port} 0 mode=play")
-    if "wfd_display_edid" in requested_params:
-        edid_magic = b"\x00\xff\xff\xff\xff\xff\xff\x00"
-        if info.connected and info.edid_bytes[:8] == edid_magic:
-            edid_len_blocks = max(1, len(info.edid_bytes) // 128)
-            hex_payload = info.edid_bytes[: edid_len_blocks * 128].hex()
-            lines.append(f"wfd_display_edid: {edid_len_blocks:04X} {hex_payload}")
-        else:
-            lines.append("wfd_display_edid: none")
-    if "intel_friendly_name" in requested_params:
-        lines.append(f"intel_friendly_name: {cfg.device_name}")
-    if "intel_sink_manufacturer_name" in requested_params:
-        lines.append("intel_sink_manufacturer_name: picast")
-    if "intel_sink_model_name" in requested_params:
-        lines.append("intel_sink_model_name: picast-trixie")
-    if "intel_sink_version" in requested_params:
-        lines.append("intel_sink_version: 2.0.0")
-    if "intel_sink_device_URL" in requested_params:
-        lines.append("intel_sink_device_URL: none")
-    if "wfd_idr_request_capability" in requested_params:
-        lines.append("wfd_idr_request_capability: 1")
-    if "wfd_I2C" in requested_params:
-        lines.append("wfd_I2C: none")
-    if "wfd_standby_resume_capability" in requested_params:
-        lines.append("wfd_standby_resume_capability: none")
-
-    return "\r\n".join(lines) + ("\r\n" if lines else "")
-
-
-def format_rtsp_response(
-    cseq: str,
-    body: str = "",
-    extra_headers: list[str] | None = None,
-) -> bytes:
-    """Format an RTSP/1.0 200 OK response frame with accurate Content-Length."""
-    headers = ["RTSP/1.0 200 OK", f"CSeq: {cseq}"]
-    if extra_headers:
-        headers.extend(extra_headers)
-    if body:
-        headers.append("Content-Type: text/parameters")
-        headers.append(f"Content-Length: {len(body.encode('utf-8'))}")
-    payload = "\r\n".join(headers) + "\r\n\r\n" + body
-    return payload.encode("utf-8")
-
-
 async def handle_rtsp_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -354,8 +159,6 @@ async def handle_rtsp_connection(
         if events:
             await events.on_session_started(peer_ip)
 
-        # Inspect once per connection: M3 may arrive several times, and the DRM
-        # sysfs EDID read does not change mid-negotiation.
         display_info = inspect_display()
         framer = RtspStreamFramer()
         runner = PlayerProcessRunner()
@@ -373,11 +176,9 @@ async def handle_rtsp_connection(
         loop = asyncio.get_running_loop()
         idr_transport: asyncio.BaseTransport | None = None
         rtcp_transport: asyncio.BaseTransport | None = None
-        bound_idr_port = cfg.idr_ipc_port
+        bound_idr_port = 0
         if cfg.idr_on_loss:
             try:
-                # Ephemeral loopback port (matching upstream `d2.py`) avoids
-                # colliding with RTCP on `rtp_port + 1` (1029).
                 idr_transport, _ = await loop.create_datagram_endpoint(
                     lambda: _IdrUdpProtocol(idr_queue),
                     local_addr=("127.0.0.1", 0),
@@ -424,9 +225,6 @@ async def handle_rtsp_connection(
                 logger.debug("IDR forwarder stopped on socket close: %s", exc)
 
         idr_task = asyncio.create_task(idr_forwarder())
-        # One persistent task per connection instead of a fresh `asyncio.Task`
-        # per incoming chunk (read_task still rotates; exit_task must not, so
-        # `player_exited.wait()` stays observable across loop iterations).
         exit_task: asyncio.Task[bool] | None = None
 
         try:
@@ -461,8 +259,6 @@ async def handle_rtsp_connection(
                     cseq = extract_cseq(frame)
 
                     if text.startswith("OPTIONS"):
-                        # Per WFD §6.1.2 (and upstream `d2.py`), a Sink's M1
-                        # `Public:` header lists only GET_PARAMETER / SET_PARAMETER.
                         methods = "org.wfa.wfd1.0, SET_PARAMETER, GET_PARAMETER"
                         if resolve_wfd2_hevc_enabled(cfg, caps):
                             methods = "org.wfa.wfd2.0, " + methods
@@ -496,7 +292,7 @@ async def handle_rtsp_connection(
                         if body_part.strip():
                             params = [ln.strip() for ln in body_part.splitlines() if ln.strip()]
                             logger.info("RTSP SET_PARAMETER: %s", " | ".join(params))
-                        if "wfd2_video_formats" in text and resolve_wfd2_hevc_enabled(cfg, caps):
+                        if is_wfd2_hevc_selected(text) and resolve_wfd2_hevc_enabled(cfg, caps):
                             negotiated_codec = "h265"
                         if "wfd_presentation_URL:" in text:
                             presentation_url = parse_presentation_url(text, peer_ip)
@@ -522,10 +318,16 @@ async def handle_rtsp_connection(
                                         asyncio.DatagramProtocol,
                                         local_addr=("0.0.0.0", negotiated_rtp_port + 1),
                                     )
-                            if await runner.start(
+                            if not await runner.start(
                                 cfg, negotiated_rtp_port, negotiated_codec, bound_idr_port
                             ):
-                                player_watch_task = asyncio.create_task(_watch_player())
+                                logger.error(
+                                    "Aborting RTSP session with %s: picast-player failed to start",
+                                    peer_ip,
+                                )
+                                await writer.drain()
+                                return
+                            player_watch_task = asyncio.create_task(_watch_player())
                             rtcp_port = negotiated_rtp_port + 1
                             logger.info(
                                 "RTSP -> M6 SETUP %s (client_port=%d-%d)",

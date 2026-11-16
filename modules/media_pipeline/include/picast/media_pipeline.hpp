@@ -37,7 +37,6 @@ struct PipelineConfig {
     AudioSinkKind audio_sink{AudioSinkKind::Auto};
     bool low_latency_sync{true};
     bool enable_audio{true};
-    bool dry_run{false};
     std::uint16_t ts_demux_latency_ms{45U};
     std::string drm_connector{};
 };
@@ -70,15 +69,11 @@ struct PipelineConfig {
  * @brief Construct a GStreamer `gst_parse_launch` pipeline string tuned for Trixie DRM/KMS.
  * @param cfg Pipeline options (codec, latency, sync, audio sink).
  * @param hw Probed hardware capabilities.
- * @param use_appsrc True when fed by `RtpJitterBuffer` via `appsrc`, false for direct `udpsrc`.
- * @param udp_port UDP port used only when `use_appsrc == false`.
  * @return Validated GStreamer pipeline description string.
  */
 [[nodiscard]] std::string build_gstreamer_pipeline_description(
     const PipelineConfig& cfg,
-    const HardwareCapabilities& hw,
-    bool use_appsrc = true,
-    std::uint16_t udp_port = 1028U);
+    const HardwareCapabilities& hw);
 
 /**
  * @brief RAII controller wrapping GStreamer MPEG-TS demuxing, hardware/NEON decoding, and kmssink.
@@ -94,7 +89,7 @@ public:
     MediaPipeline& operator=(const MediaPipeline&) = delete;
 
     /**
-     * @brief Build and start the GStreamer playback pipeline (or validate in dry-run mode).
+     * @brief Build and start the GStreamer playback pipeline.
      * @param cfg Runtime pipeline configuration.
      * @param hw Hardware probe snapshot.
      * @param on_error Callback fired if GStreamer bus reports an error or EOS.
@@ -108,7 +103,7 @@ public:
     /**
      * @brief Feed an ordered MPEG-TS chunk into the live `appsrc` stage.
      * @param ts_bytes Byte span emitted by `RtpJitterBuffer`.
-     * @return True if accepted by pipeline or running in dry-run mode.
+     * @return True if accepted by pipeline.
      */
     [[nodiscard]] bool push_mpegts(std::span<const std::uint8_t> ts_bytes);
 

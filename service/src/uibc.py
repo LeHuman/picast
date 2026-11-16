@@ -52,6 +52,7 @@ EVIOCGRAB: Final[int] = 0x40044590  # _IOC(_IOC_WRITE, 'E', 0x90, sizeof(int))
 # kernel's input_event timeval does.)
 INPUT_EVENT: Final[struct.Struct] = struct.Struct("llHHi")
 _READ_CHUNK_BYTES: Final[int] = 4096
+_MAX_TX_BUF_BYTES: Final[int] = 65536
 
 # HIDC packet framing headers (upstream ``m7`` prefixes from d2.py).
 _KEYBOARD_HEADER: Final[bytes] = bytes.fromhex("00010012010000000929")
@@ -337,6 +338,8 @@ class UibcHidcBridge:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sock: socket.socket | None = None
         self._devices: list[_GrabbedInputDevice] = []
+        self._tx_buf = bytearray()
+        self._writer_active = False
         self._closed = False
         self._done = asyncio.Event()
 
@@ -386,8 +389,8 @@ class UibcHidcBridge:
 
         for descriptor in HIDC_DESCRIPTORS:
             try:
-                sock.sendall(descriptor)
-            except OSError as exc:
+                await asyncio.wait_for(loop.sock_sendall(sock, descriptor), timeout=2.0)
+            except (OSError, TimeoutError) as exc:
                 logger.warning("UIBC HIDC descriptor send to %s failed: %s", self._peer_ip, exc)
                 self.close()
                 return False
@@ -404,11 +407,16 @@ class UibcHidcBridge:
         return True
 
     def close(self) -> None:
-        """Unregister readers, release EVIOCGRAB, close fds and TCP. Idempotent."""
+        """Unregister readers/writer, release EVIOCGRAB, close fds and TCP. Idempotent."""
         if self._closed:
             return
         self._closed = True
         loop = self._loop
+        if self._writer_active and loop is not None and self._sock is not None:
+            with contextlib.suppress(KeyError, ValueError, RuntimeError):
+                loop.remove_writer(self._sock.fileno())
+        self._writer_active = False
+        self._tx_buf.clear()
         for device in list(self._devices):
             if loop is not None:
                 with contextlib.suppress(KeyError, ValueError, RuntimeError):
@@ -440,7 +448,6 @@ class UibcHidcBridge:
                 if attempt < self._connect_attempts:
                     await asyncio.sleep(self._connect_delay_s)
                 continue
-            sock.settimeout(2.0)
             return sock
         logger.warning(
             "UIBC HIDC connect to %s:%d failed after %d attempts: %s",
@@ -467,9 +474,64 @@ class UibcHidcBridge:
         self._devices.append(device)
         loop.add_reader(fd, self._on_input_ready, fd, device.state)
 
-    def _on_input_ready(self, fd: int, state: UibcHidcState) -> None:
+    def _enqueue_tx(self, packet: bytes) -> bool:
+        """Send non-blocking or queue remaining bytes via `loop.add_writer`."""
         sock = self._sock
-        if sock is None:
+        loop = self._loop
+        if sock is None or loop is None:
+            return False
+        if not self._tx_buf:
+            try:
+                sent = sock.send(packet)
+            except BlockingIOError:
+                sent = 0
+            except OSError as exc:
+                logger.debug("UIBC HIDC send error (%s); shutting bridge down", exc)
+                self.close()
+                return False
+            if sent == len(packet):
+                return True
+            packet = packet[sent:]
+        if len(self._tx_buf) + len(packet) > _MAX_TX_BUF_BYTES:
+            logger.debug("UIBC HIDC TX queue full; dropping packet under backpressure")
+            return True
+        self._tx_buf.extend(packet)
+        if not self._writer_active:
+            try:
+                loop.add_writer(sock.fileno(), self._on_tx_ready)
+                self._writer_active = True
+            except (OSError, ValueError, RuntimeError) as exc:
+                logger.debug("UIBC HIDC add_writer failed (%s); shutting bridge down", exc)
+                self.close()
+                return False
+        return True
+
+    def _on_tx_ready(self) -> None:
+        """Flush buffered HIDC packets when TCP socket becomes writable."""
+        sock = self._sock
+        loop = self._loop
+        if sock is None or loop is None or self._closed:
+            return
+        while self._tx_buf:
+            try:
+                sent = sock.send(self._tx_buf)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                logger.debug("UIBC HIDC TX flush error (%s); shutting bridge down", exc)
+                self.close()
+                return
+            if sent <= 0:
+                self.close()
+                return
+            del self._tx_buf[:sent]
+        if self._writer_active:
+            with contextlib.suppress(KeyError, ValueError, RuntimeError):
+                loop.remove_writer(sock.fileno())
+            self._writer_active = False
+
+    def _on_input_ready(self, fd: int, state: UibcHidcState) -> None:
+        if self._sock is None:
             return
         while True:
             try:
@@ -484,16 +546,12 @@ class UibcHidcBridge:
                 self._release_device(fd)
                 return
             usable = len(chunk) - (len(chunk) % INPUT_EVENT.size)
-            try:
-                for _tv_sec, _tv_usec, event_type, code, value in INPUT_EVENT.iter_unpack(
-                    chunk[:usable]
-                ):
-                    for packet in state.translate(event_type, code, value):
-                        sock.sendall(packet)
-            except OSError as exc:
-                logger.debug("UIBC HIDC stream error (%s); shutting bridge down", exc)
-                self.close()
-                return
+            for _tv_sec, _tv_usec, event_type, code, value in INPUT_EVENT.iter_unpack(
+                chunk[:usable]
+            ):
+                for packet in state.translate(event_type, code, value):
+                    if not self._enqueue_tx(packet):
+                        return
 
     def _release_device(self, fd: int) -> None:
         loop = self._loop

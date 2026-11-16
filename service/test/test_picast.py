@@ -53,6 +53,7 @@ from src.splash import (
     StarField,
     _fb_background,
     _fb_pattern,
+    _FbSplashAnimator,
     _scale_color,
     build_fb_canvas,
     fb0_geometry,
@@ -61,10 +62,11 @@ from src.splash import (
     render_color_block_text,
 )
 from src.supplicant_manager import (
+    LOG_PATH,
     build_supplicant_config,
     parse_nm_keyfile,
     read_host_regdom,
-    scan_nm_keyfiles,
+    scan_nm_wifi_credentials,
 )
 from src.uibc import (
     BTN_LEFT,
@@ -79,7 +81,15 @@ from src.uibc import (
     encode_keyboard_report,
     encode_mouse_report,
 )
-from src.wifi_p2p import build_dnsmasq_args, parse_orphan_p2p_interfaces, parse_station_freq
+from src.wfd_protocol import is_wfd2_hevc_selected
+from src.wifi_p2p import (
+    P2P_CLIENT_IP,
+    build_dnsmasq_args,
+    parse_orphan_p2p_interfaces,
+    parse_peer_mac,
+    parse_station_freq,
+    resolve_leased_ip,
+)
 from src.wpa_ctrl import WpaCtrlClient, WpaCtrlMonitor, wpa_request
 
 
@@ -198,13 +208,18 @@ def test_wfd_m3_response_includes_h264_and_conditional_wfd2(tmp_path: Path) -> N
     assert "wfd2_video_formats: 08 00 02 01 0001FFFF" in resp
 
     resp_30 = build_wfd_m3_response(
-        "wfd2_video_formats\r\nwfd_video_formats\r\n",
-        PicastConfig(max_fps="30"),
+        "wfd2_video_formats\r\nwfd_video_formats\r\nwfd_audio_codecs\r\n",
+        PicastConfig(max_fps="30", audio_codec="lpcm"),
         pi5_caps,
         1028,
     )
     assert f"wfd_video_formats: {build_wfd_video_formats('1920x1080', 30)}" in resp_30
     assert "wfd2_video_formats: 08 00 02 01 00015555" in resp_30
+    assert "wfd_audio_codecs: LPCM 00000003 00" in resp_30
+
+    assert is_wfd2_hevc_selected("wfd2_video_formats: 08 00 02 01 0001FFFF 00 00 00\r\n")
+    assert not is_wfd2_hevc_selected("wfd2_video_formats: none\r\n")
+    assert not is_wfd2_hevc_selected("wfd2_video_formats: 08 00 02 02 0001FFFF 00 00 00\r\n")
 
 
 def test_mice_source_ready_and_p2p_helpers(tmp_path: Path) -> None:
@@ -225,6 +240,21 @@ def test_mice_source_ready_and_p2p_helpers(tmp_path: Path) -> None:
     assert parse_orphan_p2p_interfaces(iw_out) == ["p2p-wlan0-0"]
     args = build_dnsmasq_args("p2p-wlan0-0", tmp_path / "leases")
     assert "--interface=p2p-wlan0-0" in args
+    assert "--port=0" in args
+    assert "--dhcp-range=192.168.173.80,192.168.173.120,255.255.255.0,5m" in args
+
+    leases = tmp_path / "dnsmasq.leases"
+    leases.write_text(
+        "1700000100 aa:bb:cc:dd:ee:01 192.168.173.80 DESKTOP *\n"
+        "1700000200 aa:bb:cc:dd:ee:02 192.168.173.85 LAPTOP *\n",
+        encoding="utf-8",
+    )
+    assert resolve_leased_ip(leases, "AA:BB:CC:DD:EE:01") == "192.168.173.80"
+    assert resolve_leased_ip(leases, "aa:bb:cc:dd:ee:02") == "192.168.173.85"
+    assert resolve_leased_ip(tmp_path / "missing.leases", "aa:bb:cc:dd:ee:02") == P2P_CLIENT_IP
+    assert parse_peer_mac("P2P-DEVICE-FOUND AA:BB:CC:DD:EE:FF p2p_dev_addr=...") == (
+        "aa:bb:cc:dd:ee:ff"
+    )
 
     wpa_status = "bssid=02:00:00:00:00:01\nssid=ExampleNet\nfreq=2457\nwpa_state=COMPLETED\n"
     assert parse_station_freq(wpa_status) == 2457
@@ -233,12 +263,13 @@ def test_mice_source_ready_and_p2p_helpers(tmp_path: Path) -> None:
 
 
 def test_supplicant_config_build() -> None:
-    conf = build_supplicant_config("ExampleNet", "hunter22", "picast")
-    assert "ssid=\"ExampleNet\"" in conf
-    assert "psk=\"hunter22\"" in conf
+    conf = build_supplicant_config('Ex"ample\\Net', 'hunt"er\\22', "picast")
+    assert 'ssid="Ex\\"ample\\\\Net"' in conf
+    assert 'psk="hunt\\"er\\\\22"' in conf
     assert "p2p_go_intent=15" in conf
     assert "device_type=7-0050F204-1" in conf
     assert "DIR=/run/picast/wpa" in conf
+    assert str(LOG_PATH).startswith("/run/picast/")
 
     open_conf = build_supplicant_config("OpenNet", None, "picast")
     assert "key_mgmt=NONE" in open_conf
@@ -490,12 +521,32 @@ def test_starfield_default_max_stars_caps() -> None:
     assert StarField(1920, 1080, random.Random(5)).max_stars == (1920 * 1080) // 30_000
 
 
-def test_build_fb_canvas_defaults_static(tmp_path: Path) -> None:
+def test_build_fb_canvas_defaults_static() -> None:
     """Defaults (phase=0, no stars) render byte-identical to the pre-animation layout."""
     state = _splash_canvas_state()
     c1 = build_fb_canvas(state, 1920, 1080)
     c2 = build_fb_canvas(state, 1920, 1080, phase=0.0, starfield=None)
     assert c1 == c2
+
+
+def test_dirty_rect_splash_animator_matches_full_canvas() -> None:
+    """Incremental dirty-rect updates must stay pixel-identical to full canvas rebuilds."""
+    width, height, bpp = 640, 480, 16
+    state = _splash_canvas_state()
+    fb_mem = bytearray(width * height * (bpp // 8))
+    animator = _FbSplashAnimator(width, height, bpp)
+    field = StarField(width, height, random.Random(42), max_stars=8, spawn_per_tick=4, bpp=bpp)
+
+    def _write_fn(offset: int, data: bytes | bytearray) -> None:
+        fb_mem[offset : offset + len(data)] = data
+
+    for step in range(8):
+        now_s = step * 0.25
+        phase = (now_s / 1.0) % 1.0
+        field.tick(now_s)
+        animator.render_tick(state, phase, field, now_s, _write_fn)
+        expected = build_fb_canvas(state, width, height, phase=phase, starfield=field, bpp=bpp)
+        assert fb_mem == expected
 
 
 def test_cmdline_kms_hotplug_toggle() -> None:
@@ -577,19 +628,22 @@ def test_nm_keyfile_ssid_psk_parsing(tmp_path: Path) -> None:
 
     conn_dir = tmp_path / "system-connections"
     conn_dir.mkdir()
-    # First keyfile lacks the keys entirely; parser must keep scanning.
-    (conn_dir / "guest.nmconnection").write_text(
-        "[connection]\nid=guest\n[wifi]\nmode=infrastructure\n", encoding="utf-8"
+    # First keyfile has no SSID; scanner must advance to home.nmconnection and return (ssid, psk).
+    (conn_dir / "00-incomplete.nmconnection").write_text(
+        "[connection]\nid=incomplete\n[wifi]\nmode=infrastructure\n", encoding="utf-8"
     )
-    (conn_dir / "home.nmconnection").write_text(text, encoding="utf-8")
-    assert scan_nm_keyfiles((str(conn_dir),), ("wifi", "802-11-wireless"), "ssid") == "Home Net"
-    assert (
-        scan_nm_keyfiles((str(conn_dir),), ("802-11-wireless-security",), "psk")
-        == "secret pass"
+    (conn_dir / "01-home.nmconnection").write_text(text, encoding="utf-8")
+    assert scan_nm_wifi_credentials((str(conn_dir),)) == ("Home Net", "secret pass")
+
+    # Open network listed first must return (OpenCafe, None), never pairing Network 2's PSK!
+    open_dir = tmp_path / "open-first"
+    open_dir.mkdir()
+    (open_dir / "01-open.nmconnection").write_text(
+        "[wifi]\nssid=OpenCafe\nmode=infrastructure\n", encoding="utf-8"
     )
-    # PSK must not be picked up from a foreign group, and absent dirs yield None.
-    assert scan_nm_keyfiles((str(conn_dir),), ("wifi",), "psk") is None
-    assert scan_nm_keyfiles((str(tmp_path / "absent"),), ("wifi",), "ssid") is None
+    (open_dir / "02-secured.nmconnection").write_text(text, encoding="utf-8")
+    assert scan_nm_wifi_credentials((str(open_dir),)) == ("OpenCafe", None)
+    assert scan_nm_wifi_credentials((str(tmp_path / "absent"),)) is None
 
 
 def test_read_host_regdom_and_supplicant_country(tmp_path: Path) -> None:
@@ -984,6 +1038,57 @@ def test_uibc_bridge_rescan_grabs_hot_plugged_devices_once(tmp_path: Path) -> No
         assert stub_loop.registered == set()
 
     asyncio.run(scenario())
+
+
+def test_uibc_bridge_nonblocking_tx_buffering() -> None:
+    """HIDC bridge keeps TCP socket non-blocking and flushes partial writes via add_writer."""
+
+    class _FakeWriterLoop:
+        def __init__(self) -> None:
+            self.writers: dict[int, Callable[[], None]] = {}
+
+        def add_writer(self, fd: int, callback: Callable[[], None]) -> None:
+            self.writers[fd] = callback
+
+        def remove_writer(self, fd: int) -> bool:
+            return self.writers.pop(fd, None) is not None
+
+    class _PartialSock:
+        def __init__(self) -> None:
+            self.sent = bytearray()
+            self.calls = 0
+
+        def fileno(self) -> int:
+            return 42
+
+        def send(self, data: bytes | bytearray) -> int:
+            self.calls += 1
+            if self.calls == 1:
+                # Simulate short write of 4 bytes; rest queues for _on_tx_ready.
+                self.sent.extend(data[:4])
+                return 4
+            if self.calls == 2:
+                raise BlockingIOError
+            self.sent.extend(data)
+            return len(data)
+
+        def close(self) -> None:
+            pass
+
+    bridge = UibcHidcBridge("127.0.0.1", 1234)
+    loop = _FakeWriterLoop()
+    sock = _PartialSock()
+    bridge._loop = cast(asyncio.AbstractEventLoop, loop)
+    bridge._sock = cast(socket.socket, sock)
+    packet = encode_keyboard_report(0x02, 0x04)
+    assert bridge._enqueue_tx(packet) is True
+    assert 42 in loop.writers
+    bridge._on_tx_ready()  # hits BlockingIOError -> writer remains registered
+    assert 42 in loop.writers
+    bridge._on_tx_ready()  # drains buffer -> writer removed
+    assert 42 not in loop.writers
+    assert bytes(sock.sent) == packet
+    bridge.close()
 
 
 def test_fb_pattern_32bpp_identity() -> None:

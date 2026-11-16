@@ -207,11 +207,18 @@ std::expected<std::vector<std::uint8_t>, std::string> read_drm_edid(
     return std::unexpected("No connected HDMI DRM EDID found in " + drm_sysfs.string());
 }
 
-HardwareCapabilities probe_hardware(const ProbePaths& paths) {
+HardwareCapabilities probe_hardware() {
     HardwareCapabilities caps;
 
-    const std::string model_str = read_text_file(paths.device_tree_model);
-    const std::string cpuinfo_str = read_text_file(paths.cpuinfo);
+    const std::filesystem::path dt_model{"/proc/device-tree/model"};
+    const std::filesystem::path cpuinfo{"/proc/cpuinfo"};
+    const std::filesystem::path drm_sysfs{"/sys/class/drm"};
+    const std::filesystem::path dev_dir{"/dev"};
+    const std::filesystem::path v4l2_sysfs{"/sys/class/video4linux"};
+    const std::filesystem::path firmware_edid{"/lib/firmware/picast-edid.bin"};
+
+    const std::string model_str = read_text_file(dt_model);
+    const std::string cpuinfo_str = read_text_file(cpuinfo);
     caps.board = classify_board_model(model_str, cpuinfo_str);
     caps.model_name = !model_str.empty() ? model_str : std::string{to_string(caps.board)};
 
@@ -241,9 +248,9 @@ HardwareCapabilities probe_hardware(const ProbePaths& paths) {
     std::error_code ec;
     if (caps.board != PiBoardModel::Pi5) {
         std::string h264_dev =
-            find_v4l2_node_by_name(paths.v4l2_sysfs, paths.dev_dir, "bcm2835-codec-decode");
+            find_v4l2_node_by_name(v4l2_sysfs, dev_dir, "bcm2835-codec-decode");
         if (h264_dev.empty()) {
-            const auto fallback_v10 = paths.dev_dir / "video10";
+            const auto fallback_v10 = dev_dir / "video10";
             if (std::filesystem::exists(fallback_v10, ec)) {
                 h264_dev = fallback_v10.string();
             }
@@ -255,10 +262,9 @@ HardwareCapabilities probe_hardware(const ProbePaths& paths) {
     }
 
     if (caps.board == PiBoardModel::Pi4 || caps.board == PiBoardModel::Pi5) {
-        std::string hevc_dev =
-            find_v4l2_node_by_name(paths.v4l2_sysfs, paths.dev_dir, "rpi-hevc-dec");
+        std::string hevc_dev = find_v4l2_node_by_name(v4l2_sysfs, dev_dir, "rpi-hevc-dec");
         if (hevc_dev.empty()) {
-            const auto fallback_v19 = paths.dev_dir / "video19";
+            const auto fallback_v19 = dev_dir / "video19";
             if (std::filesystem::exists(fallback_v19, ec)) {
                 hevc_dev = fallback_v19.string();
             }
@@ -272,22 +278,22 @@ HardwareCapabilities probe_hardware(const ProbePaths& paths) {
     caps.recommended_h264 =
         caps.has_v4l2_h264_m2m ? DecoderBackend::V4l2H264M2M : DecoderBackend::SoftwareNeonH264;
 
-    if (!paths.override_edid.empty() && std::filesystem::exists(paths.override_edid, ec)) {
-        auto override_bytes = read_binary_file(paths.override_edid);
+    if (std::filesystem::exists(firmware_edid, ec)) {
+        auto override_bytes = read_binary_file(firmware_edid);
         if (override_bytes.size() >= 128U) {
             caps.edid = std::move(override_bytes);
         }
     }
     if (caps.edid.empty()) {
-        if (auto edid_res = read_drm_edid(paths.drm_sysfs); edid_res.has_value()) {
+        if (auto edid_res = read_drm_edid(drm_sysfs); edid_res.has_value()) {
             caps.edid = std::move(*edid_res);
             caps.drm_connected = true;
         }
     }
 
-    if (std::filesystem::exists(paths.drm_sysfs, ec)) {
+    if (std::filesystem::exists(drm_sysfs, ec)) {
         std::vector<std::filesystem::path> connectors;
-        for (const auto& entry : std::filesystem::directory_iterator(paths.drm_sysfs, ec)) {
+        for (const auto& entry : std::filesystem::directory_iterator(drm_sysfs, ec)) {
             if (ec) {
                 break;
             }
@@ -296,15 +302,29 @@ HardwareCapabilities probe_hardware(const ProbePaths& paths) {
             }
         }
         std::sort(connectors.begin(), connectors.end());
+        std::filesystem::path chosen;
         for (const auto& conn : connectors) {
             if (read_text_file(conn / "status") == "connected") {
-                caps.drm_connector = conn.filename().string();
+                chosen = conn;
                 caps.drm_connected = true;
                 break;
             }
         }
-        if (caps.drm_connector.empty() && !connectors.empty()) {
-            caps.drm_connector = connectors.front().filename().string();
+        if (chosen.empty() && !connectors.empty()) {
+            chosen = connectors.front();
+        }
+        if (!chosen.empty()) {
+            caps.drm_connector = chosen.filename().string();
+            const std::string cid_str = read_text_file(chosen / "connector_id");
+            if (!cid_str.empty()) {
+                try {
+                    const unsigned long parsed_id = std::stoul(cid_str);
+                    if (parsed_id > 0UL) {
+                        caps.drm_connector_id = static_cast<std::uint32_t>(parsed_id);
+                    }
+                } catch (...) {
+                }
+            }
         }
     }
 

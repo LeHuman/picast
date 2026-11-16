@@ -22,15 +22,6 @@
       "preLaunchTask": "CMake: Build & Test All Targets (Debug)"
     },
     {
-      "name": "Run picast-player (--probe)",
-      "type": "cppdbg",
-      "request": "launch",
-      "program": "${workspaceFolder}/build/debug/app/picast-player",
-      "args": ["--probe"],
-      "cwd": "${workspaceFolder}",
-      "MIMode": "gdb"
-    },
-    {
       "name": "Pytest Service Control Plane",
       "type": "debugpy",
       "request": "launch",

@@ -52,13 +52,12 @@ class PicastDaemon:
             return pin
         return "PBC AUTO" if self.cfg.pin_mode is PinMode.NONE else "--------"
 
-    def _splash_state(self, status: str, ip_hint: str = "") -> SplashState:
+    def _splash_state(self, status: str) -> SplashState:
         return SplashState(
             device_name=self.cfg.device_name,
             transport_label=self._transport_label(),
             pin_display=self._pin_label(),
             status_line=status,
-            ip_hint=ip_hint,
         )
 
     def _start_splash_animation(self) -> None:
@@ -96,28 +95,26 @@ class PicastDaemon:
         self._splash_anim_stop = None
         self._splash_anim_thread = None
 
-    def _refresh_splash(self, status: str, ip_hint: str = "") -> None:
+    def _refresh_splash(self, status: str) -> None:
         self._splash_status = status
         if self._splash_anim_thread is not None and self._splash_anim_thread.is_alive():
             # Animator is running; it repaints next tick with the latest status.
             return
-        render_splash(self._splash_state(status, ip_hint))
+        render_splash(self._splash_state(status))
 
-    async def _refresh_splash_async(self, status: str, ip_hint: str = "") -> None:
-        # The framebuffer path writes ~8.3 MB to /dev/fb0; keep it off the
-        # asyncio event loop so RTSP keepalives are never stalled by redraws.
+    async def _refresh_splash_async(self, status: str) -> None:
         self._splash_status = status
         if self._splash_anim_thread is not None and self._splash_anim_thread.is_alive():
             # Animator is running; it repaints next tick with the latest status.
             return
-        await asyncio.to_thread(render_splash, self._splash_state(status, ip_hint))
+        await asyncio.to_thread(render_splash, self._splash_state(status))
 
     async def on_session_started(self, peer_ip: str) -> None:
         """Pause background discovery scans and update splash during an active cast."""
         self._stop_splash_animation()
         if self._p2p is not None:
             await self._p2p.set_scan_suppression_async(True)
-        await self._refresh_splash_async(f"CASTING FROM {peer_ip}", ip_hint=f"PEER {peer_ip}")
+        await self._refresh_splash_async(f"CASTING FROM {peer_ip}")
 
     async def on_session_ended(self, peer_ip: str) -> None:
         """Restore discovery listeners and apply configured PIN rotation after disconnect."""

@@ -36,7 +36,7 @@ void test_valid_cli_arguments() {
         "--av-sync",
         "--audio-sink",
         "pipewire",
-        "--dry-run",
+        "--no-audio",
     };
 
     const auto parsed = picast::parse_app_args(argv);
@@ -51,7 +51,7 @@ void test_valid_cli_arguments() {
         EXPECT_TRUE(parsed->pipeline.video_codec == picast::VideoCodec::H265);
         EXPECT_TRUE(!parsed->pipeline.low_latency_sync);
         EXPECT_TRUE(parsed->pipeline.audio_sink == picast::AudioSinkKind::PipeWire);
-        EXPECT_TRUE(parsed->pipeline.dry_run);
+        EXPECT_TRUE(!parsed->pipeline.enable_audio);
     }
 }
 

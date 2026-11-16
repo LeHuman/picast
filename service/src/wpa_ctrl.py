@@ -131,7 +131,7 @@ class WpaCtrlMonitor:
         loop = asyncio.get_running_loop()
         try:
             self._ctrl_dir.mkdir(parents=True, exist_ok=True)
-            local = self._ctrl_dir / f"picast-mon-{os.getpid()}"
+            local = self._ctrl_dir / f"picast-mon-{os.getpid()}-{next(_CLIENT_SEQ)}"
             with contextlib.suppress(OSError):
                 local.unlink()
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -171,6 +171,12 @@ class WpaCtrlMonitor:
                 loop.sock_recv(sock, _RECV_BUFSIZE), timeout=timeout_s
             )
         except TimeoutError:
+            return None
+        except OSError:
+            await self.close()
+            return None
+        if not raw:
+            await self.close()
             return None
         return raw.decode("utf-8", errors="replace").strip()
 

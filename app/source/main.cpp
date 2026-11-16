@@ -101,20 +101,6 @@ int main(int argc, char* argv[]) {
         const auto cfg = *cfg_res;
         const auto hw = picast::probe_hardware();
 
-        if (cfg.probe_only) {
-            std::cout << std::format(
-                "board={}\nmodel={}\nv4l2_h264={}\nv4l2_hevc={}\n5ghz_wifi={}\nht40={}\ndecoder={}\ndrm={}\n",
-                picast::to_string(hw.board),
-                hw.model_name,
-                hw.has_v4l2_h264_m2m,
-                hw.has_v4l2_hevc_stateless,
-                hw.has_5ghz_wifi,
-                hw.supports_ht40,
-                picast::to_string(picast::resolve_video_decoder(cfg.pipeline, hw)),
-                hw.drm_connector);
-            return 0;
-        }
-
         picast::SocketGuard rtp_sock{socket(AF_INET, SOCK_DGRAM, 0)};
         picast::SocketGuard idr_sock{socket(AF_INET, SOCK_DGRAM, 0)};
         if (!rtp_sock.valid()) {

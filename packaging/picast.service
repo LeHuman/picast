@@ -1,6 +1,5 @@
 [Unit]
 Description=picast Low-Latency Miracast & MICE Receiver
-Documentation=https://github.com/LeHuman/picast
 After=network-online.target NetworkManager.service systemd-user-sessions.service wpa_supplicant.service avahi-daemon.service
 Wants=network-online.target
 Conflicts=getty@tty1.service display-manager.service lightdm.service gdm3.service sddm.service

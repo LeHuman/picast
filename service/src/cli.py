@@ -101,9 +101,14 @@ def cmd_configure(config_path: Path, non_interactive: bool) -> int:
         cfg.tcp_nodelay = _prompt_bool_with_guide("tcp_nodelay", cfg.tcp_nodelay)
         cfg.idr_on_loss = _prompt_bool_with_guide("idr_on_loss", cfg.idr_on_loss)
         cfg.uibc_enabled = _prompt_bool_with_guide("uibc_enabled", cfg.uibc_enabled)
-        a_ans = _prompt_with_guide("audio_sink", cfg.audio_sink.value).lower()
-        if a_ans in {m.value for m in AudioSinkMode}:
-            cfg.audio_sink = AudioSinkMode(a_ans)
+        cfg.audio_enabled = _prompt_bool_with_guide("audio_enabled", cfg.audio_enabled)
+        if cfg.audio_enabled:
+            ac_ans = _prompt_with_guide("audio_codec", cfg.audio_codec).lower()
+            if ac_ans in {"aac", "lpcm"}:
+                cfg.audio_codec = ac_ans
+            a_ans = _prompt_with_guide("audio_sink", cfg.audio_sink.value).lower()
+            if a_ans in {m.value for m in AudioSinkMode}:
+                cfg.audio_sink = AudioSinkMode(a_ans)
 
     save_config(cfg, config_path)
     print(f"\nSaved configuration to {config_path}")
